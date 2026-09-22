@@ -161,6 +161,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <iostream>
+#include <vector>
 #include "Lander_Control.h"
 
 #define FLOATING_TOLERANCE 0.00001f
@@ -178,23 +179,19 @@ int safe_posx(double *posx){
 }
 
 struct game_state {
-	int initial = 1;
+	// int initial = 1;
 	double pos[2];
 	double vel[2];
 	double accel[2];
 	double angle;
 	double sonar[36];
+    double time = 0;
 };
 
 void get_initial_game_state(struct game_state *state) {
 	/**
 		TODO: MAKE SURE THESE USE THE SAFE EQUIVALENTS 
 	*/
-	
-	if (state->initial == 0) {
-		return;
-	}
-	state->initial = 0;
 	safe_posx(&state->pos[0]);
 	state->pos[1] = Position_Y();
 	state->vel[0] = Velocity_X();
@@ -256,51 +253,197 @@ void solve_equation_1d(double *u, double *v, double *a, double *t, double *s, ch
 }
 
 
-void solve_equation_2d(double u[2], double v[2], double *a[2], double *t, double *r_i[2],double *r_f[2], char which) {
-    	switch (which){
-		case 'v':
-            solve_equation_1d(&u[0], &v[0], a[0], t, r_i[0], 'v');
-            solve_equation_1d(&u[1], &v[1], a[1], t, r_i[1], 'v');
-			break;
-		case 'u':
-            solve_equation_1d(&u[1], &v[1], a[1], t, r_i[1], 'u');
-            solve_equation_1d(&u[0], &v[0], a[0], t, r_i[0], 'u');
-			break;
-		case 'a':
-            solve_equation_1d(&u[0], &v[0], a[0], t, r_i[0], 'a');
-            solve_equation_1d(&u[1], &v[1], a[1], t, r_i[1], 'a');
-			break;
-		case 't':
-            double t_possibilities[2]; // Stores the value of t from each equation solved.
-            solve_equation_1d(&u[0], &v[0], a[0], t_possibilities, r_i[0], 't');
-            solve_equation_1d(&u[1], &v[1], a[1], t_possibilities + 1, r_i[1], 't');
 
-            if(fabs(t_possibilities[0] - t_possibilities[1]) > FLOATING_TOLERANCE) {
-                std::cerr << "Warning: The two equations for t do not match. Using the average." << std::endl;
+
+void solve_equation_2d(double u[2], double v[2], double a[2], double *t, double s[2], char which) {
+    switch (which) {
+        case 'v':
+            solve_equation_1d(&u[0], &v[0], &a[0], t, &s[0], 'v');
+            solve_equation_1d(&u[1], &v[1], &a[1], t, &s[1], 'v');
+            break;
+        case 'u':
+            solve_equation_1d(&u[0], &v[0], &a[0], t, &s[0], 'u');
+            solve_equation_1d(&u[1], &v[1], &a[1], t, &s[1], 'u');
+            break;
+        case 'a':
+            solve_equation_1d(&u[0], &v[0], &a[0], t, &s[0], 'a');
+            solve_equation_1d(&u[1], &v[1], &a[1], t, &s[1], 'a');
+            break;
+        case 't': {
+            // Solve each axis independently, then reconcile.
+            double t0 = 0.0, t1 = 0.0;
+            solve_equation_1d(&u[0], &v[0], &a[0], &t0, &s[0], 't');
+            solve_equation_1d(&u[1], &v[1], &a[1], &t1, &s[1], 't');
+            if (fabs(t0 - t1) > FLOATING_TOLERANCE) {
+                std::cerr << "Warning: x/y solutions for t disagree ("
+                          << t0 << " vs " << t1 << "). Using the average."
+                          << std::endl;
             }
-			break;
-		case 's':
-				solve_equation_1d(&u[0], &v[0], a[0], t, r_i[0], 's');
-                solve_equation_1d(&u[1], &v[1], a[1], t, r_i[1], 's');
-			break;
-		default:
-			std::cerr << "Invalid equation type" << std::endl;
-			break;
-	}
+            *t = (t0 + t1) / 2.0;
+            break;
+        }
+        case 's':
+            solve_equation_1d(&u[0], &v[0], &a[0], t, &s[0], 's');
+            solve_equation_1d(&u[1], &v[1], &a[1], t, &s[1], 's');
+            break;
+        default:
+            std::cerr << "Invalid equation type" << std::endl;
+            break;
+    }
 }
 
 
+struct Action{
+    enum action_type {THRUST, ROTATE} type;
+    double value;    // Rotations in degress 
+                     // Or thrust in accelerations
+    double time;     // Duration of Action
+                     // Rotations will not need any time argument (Can be 0)
+                     // Thurst actions will require you to specify how long to thrust for.
+    int in_progress; // A bool to see if the action is running. (0 = not started, 1 = in progress, 2 = completed)
+    int start_time;
+};
+class GameControler {
+    game_state state;
 
-struct game_state state;
+    
+public:
+    class ActionHandler{
+        std::vector<Action> act_bck;
+        public:
+        
+        double is_rotating = 0; // If non-zero, shows how many degrees still to be rotated.
+        ActionHandler(){
+            act_bck = std::vector<Action>();
+        }
+
+        void optimise_actions(){
+            /** TODO: Implement a function to handle this */
+            return;
+        }
+
+        void add_action(Action act){
+            act_bck.push_back(act);
+            optimise_actions();
+        }
+
+        void clean_completed_actions(){
+            for(int i = 0; i < act_bck.size(); i++){
+                if (act_bck[i].in_progress == 2){
+                    std::swap(act_bck[i], act_bck.back());
+                    act_bck.pop_back();
+                    i--;
+                }
+            }
+        }
+
+        void run_actions(game_state &state){
+            for (Action &act : act_bck){
+                if (act.in_progress == 0){
+                    act.in_progress = 1;
+                    switch (act.type){
+                        case Action::THRUST:
+                            if (is_rotating == 0){
+                                Main_Thruster(act.value);
+                                act.start_time = state.time;
+                                std::cerr << "Starting thrust\n";
+                            }
+                            else{
+                                act.in_progress = 0;
+                            }
+                            break;
+                        case Action::ROTATE:
+                            robust_rotate(act.value);
+                            is_rotating = act.value;
+                            std::cerr << "Starting rotation\n";
+                            break;
+                    }
+                } else {
+                    if (act.type == Action::THRUST){
+                        if (state.time >= act.start_time + act.time){
+                            Main_Thruster(0.0);
+                            act.in_progress = 2; // Mark as completed
+                        }
+                    } else {
+                        act.in_progress = 2; // Mark as completed
+                    }
+                }
+            }
+
+            clean_completed_actions();
+        }
+
+    };
+
+    ActionHandler action_handler;
+
+    GameControler(){
+        get_initial_game_state(&state);
+        action_handler = ActionHandler();
+        stabilise(0.5);
+    }
+
+    void get_initial_state(){
+        safe_posx(&(state.pos[0]));
+        state.pos[1] = Position_Y();
+        state.vel[0] = Velocity_X();
+        state.vel[1] = Velocity_Y();
+        state.accel[0] = 0;
+        state.accel[1] = -G_ACCEL;
+        state.angle = Angle();
+        for (int i = 0; i < 36; i++) {
+            state.sonar[i] = SONAR_DIST[i];
+        }
+    }
+
+    void stabilise(double target_time) {
+        double u[2] = {state.vel[0], state.vel[1]}; // current velocity
+        double v[2] = {0.0, 0.0};                   // we want zero
+        double required_accel[2] = {0.0, 0.0};
+        double s[2] = {0.0, 0.0}; // unused by 'a'.
+
+        solve_equation_2d(u, v, required_accel, &target_time, s, 'a');
+
+        required_accel[1] += G_ACCEL; // thruster must also cancel gravity and kill vel.
+
+        double required_angle = atan2(required_accel[0], required_accel[1]) * 180.0 / PI;
+        double thrust_mag = sqrt(required_accel[0] * required_accel[0] +
+                                required_accel[1] * required_accel[1]);
+
+        std::cerr << "Thrust magnitude: " << thrust_mag << " Required angle: " << required_angle << "\n";
+
+        action_handler.add_action({Action::ROTATE, required_angle - state.angle, 0.0, 0});
+        // robust_rotate(required_angle - state.angle);
+        action_handler.add_action({Action::THRUST, thrust_mag, target_time, 0});
+    }
+
+    void tick(){
+        std::cerr << action_handler.is_rotating << "\r";
+        action_handler.run_actions(state);
+        if(fabs(action_handler.is_rotating) >= 500){
+            action_handler.is_rotating -= state.time * MAX_ROT_RATE * 180.0 / PI;
+        } else {
+            action_handler.is_rotating = 0;
+        }
+        state.time += T_STEP;
+
+        if (action_handler.act_bck.empty()){
+            action_handler.add_action()
+        }
+    }
+
+};
+
+/*************************************************************************************************/
+/*************************** The actual code is below this line **********************************/
 
 void Lander_Control(void) {
-	// get_initial_game_state(&state);
-
-    printf("Position: (%f, %f)\r", Position_X(), Position_Y());
 
 }
 
 void Safety_Override(void) {
+    static GameControler gc;   // constructed on first call, not at static-init time
+    gc.tick();
   /*
     This function is intended to keep the lander from
     crashing. It checks the sonar distance array,
