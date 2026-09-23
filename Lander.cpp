@@ -189,21 +189,17 @@ struct game_state {
     double time = 0;
 };
 
-void get_initial_game_state(struct game_state *state) {
-	/**
-		TODO: MAKE SURE THESE USE THE SAFE EQUIVALENTS 
-	*/
-	safe_posx(&state->pos[0]);
-	state->pos[1] = Position_Y();
-	state->vel[0] = Velocity_X();
-	state->vel[1] = Velocity_Y();
-	state->accel[0] = 0;
-	state->accel[1] = G_ACCEL;
-	state->angle = Angle();
-	for (int i = 0; i < 36; i++) {
-		state->sonar[i] = SONAR_DIST[i];
-	}
-}
+void print_state(game_state &state){
+        std::cerr << "Position: (" << state.pos[0] << ", " << state.pos[1] << ")\n";
+        std::cerr << "Real Position: (" << Position_X() << ", " << Position_Y() << ")\n";
+        std::cerr << "Velocity: (" << state.vel[0] << ", " << state.vel[1] << ")\n";
+        std::cerr << "Real Velocity: (" << Velocity_X() << ", " << Velocity_Y() << ")\n";
+        std::cerr << "Acceleration: (" << state.accel[0] << ", " << state.accel[1] << ")\n";
+        std::cerr << "Angle: " << state.angle << "\n";
+        std::cerr << "Real Angle: " << (Angle() > 180 ? Angle() - 360 : Angle()) << "\n";
+        std::cerr << "Time: " << state.time << "\n";
+        printf("\033[%dA", 8);
+    }
 
 void solve_equation_1d(double *u, double *v, double *a, double *t, double *s, char which) {
 	// Solves any of the following equations:
@@ -304,6 +300,8 @@ struct Action{
     int start_time;
 
     int is_parallel; // A bool to see if the action can be run in parallel with prev actions. (0 = no, 1 = yes)
+
+    // game_state future_state; // A representation of the what the future state "should" look like.
 };
 class GameControler {
     game_state state;
@@ -325,6 +323,7 @@ public:
         }
 
         void add_action(Action act){
+            act.in_progress = 0;
             act_bck.push_back(act);
             optimise_actions();
         }
@@ -339,23 +338,58 @@ public:
                     Main_Thruster(act.value / MT_ACCEL);
                     break;
                 case Action::ROTATE:
+                    std::cerr << "Rotating with " << act.value << "\n";
                     robust_rotate(act.value);
                     break;
             }
         }
 
         void continue_action(Action &act, game_state &state){
+
+            // If the action is finished, then we delete it
             if (state.time - act.start_time >= act.duration){
                 act.in_progress = 2;
                 switch (act.type){
                     case Action::THRUST:
+                        std::cerr << "Stopping thrust\n";
                         Main_Thruster(0.0);
                         break;
                     case Action::ROTATE:
-                        // Do nothing, rotation is instantaneous
+                        std::cerr << "Rotation completed of " << act.value << "\n";
+                        std::cerr << "Current angle: " << Angle() << "\n";
+                        // Do nothing, rotation is a single step command
                         break;
                 }
             }
+
+            // Else, we continue the action: updating the game state variables
+            else{
+                switch (act.type){
+                    case Action::THRUST:
+                        // Update the game state variables
+                        state.accel[0] = act.value * sin(state.angle * PI / 180.0);
+                        state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
+                        state.vel[0] += state.accel[0] * T_STEP;
+                        state.vel[1] += state.accel[1] * T_STEP;
+                        state.pos[0] += state.vel[0] * T_STEP;
+                        state.pos[1] += state.vel[1] * T_STEP;
+                        break;
+                    case Action::ROTATE:
+                        // Angles will be stored between -180 and 180. 
+                        // We will add hte change in rotation expected and see if it is in this range.
+                        // If not, we will adjust accordingly.
+                        double angle_change = act.value * (T_STEP / act.duration);
+                        state.angle += angle_change;
+                        // Ensure the angle is within the range [-180, 180]
+                        if (state.angle > 180.0) {
+                            state.angle -= 360.0;
+                        } else if (state.angle < -180.0) {
+                            state.angle += 360.0;
+                        }
+                        break;
+                }
+            }
+            print_state(state);
         }
 
         void clean_completed_actions(){
@@ -401,9 +435,9 @@ public:
     ActionHandler action_handler;
 
     GameControler(){
-        get_initial_game_state(&state);
+        get_initial_state();
         action_handler = ActionHandler();
-        stabilise(1);
+        stabilise(2);
     }
 
     void get_initial_state(){
@@ -418,6 +452,8 @@ public:
             state.sonar[i] = SONAR_DIST[i];
         }
     }
+
+    
 
     double find_min_travel_angle(double required_angle, double state_angle){
             double diff = required_angle - state_angle;
@@ -445,13 +481,16 @@ public:
         double destination_angle;
         double min_rot_angle;
 
-        for(int i = 0; i < 4; i++){
+        game_state future_state = state;
+
+        for(int i = 0; i < 10; i++){
             // Itterate simulation steps for time-step accuracy in calculations:
             double u[2] = {state.vel[0], state.vel[1]};
             memset(required_accel, 0, sizeof(required_accel));
             
             solve_equation_2d(u, u, G_accel, &time_offset, s, 'u'); // Account for effect of gravity on u while rotating
             solve_equation_2d(u, v, required_accel, &target_time, s, 'a'); // Calculate the required thrust acceleration
+            solve_equation_2d(u, v, required_accel, &target_time, s, 's'); // Calculate the distance travelled
 
             required_accel[1] += G_ACCEL; // thruster must also cancel gravity and kill vel.
 
@@ -466,11 +505,20 @@ public:
         thrust_mag = sqrt(required_accel[0] * required_accel[0] +
                                 required_accel[1] * required_accel[1]);
 
-        std::cerr << "Thrust magnitude: " << thrust_mag << ";\n Required angle: " << destination_angle << "\n";
+        std::cerr << "Thrust magnitude: " << thrust_mag << ";\n Change Angle: " << min_rot_angle << "\n";
+                                //    type  ---------- value ----------- duration ----in_progress
+        action_handler.add_action({Action::ROTATE, min_rot_angle, required_angle_time, .is_parallel=0});
+        action_handler.add_action({Action::THRUST, thrust_mag, target_time, .is_parallel=0});
 
-        action_handler.add_action({Action::ROTATE, min_rot_angle, required_angle_time, 0});
-        action_handler.add_action({Action::THRUST, thrust_mag, target_time, 0});
-        action_handler.add_action({Action::ROTATE, -destination_angle, required_angle_time, 0});
+        std::cerr << "rotating: " << -destination_angle << "\n";
+        action_handler.add_action({Action::ROTATE, -destination_angle, required_angle_time, .is_parallel=0});
+        action_handler.add_action({Action::THRUST, G_ACCEL, 1, .is_parallel=0});
+
+        go_up(5);
+    }
+
+    void go_up(double target_time) {
+        
     }
 
     void tick(){
