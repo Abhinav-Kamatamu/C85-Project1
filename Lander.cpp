@@ -232,6 +232,12 @@ struct game_state {
 static double rotate_start_time = 0.0;
 static double rotate_duration = 0.0;
 
+// Offset (degrees) of the thruster currently standing in for "up" in the planner's frame.
+// The planner always thinks in main-thruster terms; if the main dies we rotate a side
+// thruster into its place, and this remembers by how much.
+//   planner's angle = state.angle + thrust_frame_offset
+static double thrust_frame_offset = 0.0;
+
 void robust_rotate(double delta, struct game_state &state) {
     if (!isfinite(delta)) return;
     delta = normalize_value(delta, Nangle);
@@ -504,7 +510,6 @@ public:
                     std::cerr << "Idling for " << act.duration << "\n";
                     break;
             }
-            process_state_updates(state);
         }
 
         void continue_action(Action &act, game_state &state){
@@ -696,7 +701,7 @@ public:
     }
 
     void stabilise(double target_time) {
-        get_initial_state();
+        // get_initial_state();
         future_state = state;
 
         double u[2] = {state.vel[0], state.vel[1]}; // current velocity
@@ -858,6 +863,12 @@ public:
             action_handler.add_action({Action::THRUST, A, t2, .is_parallel=0});
         }
     }
+
+    void go_horizontal(game_state state, double travel_time) {
+        double horizontal_travel = (PLAT_X - state.pos[0]) / S_SCALE; // Horizontal distance to travel
+
+    }
+
 
     void tick(){
         if (action_handler.act_bck.empty()) {
