@@ -163,6 +163,8 @@
 #include <iostream>
 #include <vector>
 #include <string.h>
+#include <vector>
+#include <string.h>
 #include "Lander_Control.h"
 
 #define UP_ACCEL 25
@@ -170,10 +172,13 @@
 #define FLOATING_TOLERANCE 0.00001f
 #define HOVER_HEIGHT 70
 #define NSAMPLES 60
+#define HOVER_HEIGHT 70
+#define NSAMPLES 60
 
 int a = 1;
 
 struct game_state {
+	// int initial = 1;
 	// int initial = 1;
 	double pos[2];
 	double vel[2];
@@ -192,6 +197,10 @@ double normalize_angle(double a) {
 #define ROTATE_DELIVERY_RATIO 0.9507   // measured empirically
 // Rotate() consistently delivers ~95.07% of whatever asked
 // took into account Angle sensor noise and rotation time
+
+#define ROTATE_TOLERANCE 3.0   // degrees - skip re-rotating for corrections this small
+                                 // (without this, any nonzero residual misalignment
+                                 // re-triggers a full rotate cycle and thrust never sustains)
 
 // We assume single-threaded operation.
 static double rotate_start_time = 0.0;
@@ -217,66 +226,16 @@ void robust_rotate(double delta, struct game_state &state) {
 }
 
 // Returns 1 once enough simulated time has passed for the most recent
-// robust_rotate call to physically finish, 0 while still waiting. 
+// robust_rotate call to physically finish, 0 while still waiting.
 // Just timing, no sensor involved
 int robust_rotate_status(struct game_state &state) {
     return (state.time - rotate_start_time >= rotate_duration) ? 1 : 0;
 }
 
-
-void robust_thruster(double accel_x, double accel_y, struct game_state &state) {
-
-    static int    rotating        = 0;
-    static int    chosen_thruster = -1;   // 0 = Main, 1 = Left, 2 = Right
-    static double chosen_power    = 0.0;
-
-    double magnitude = sqrt(accel_x * accel_x + accel_y * accel_y);
-    if (magnitude < 1e-6) {
-        Main_Thruster(0.0); Left_Thruster(0.0); Right_Thruster(0.0);
-        rotating = 0;
-        return;
-    }
-
-    if (!rotating) {
-        double target_push_angle = atan2(accel_x, -accel_y) * (180.0 / PI);
-        const double MAIN_OFFSET = 0.0, LEFT_OFFSET = 90.0, RIGHT_OFFSET = -90.0;
-        double current_angle = state.angle;   // from game state
-
-        // Checks for thruster availability and finds the one that is closest to the target angle
-        int best = -1;
-        double best_delta = 0.0, best_abs = 1e9;
-        if (MT_OK) { double d = target_push_angle - (current_angle + MAIN_OFFSET);
-                     while (d > 180) d -= 360; while (d <= -180) d += 360;
-                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 0; } }
-        if (LT_OK) { double d = target_push_angle - (current_angle + LEFT_OFFSET);
-                     while (d > 180) d -= 360; while (d <= -180) d += 360;
-                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 1; } }
-        if (RT_OK) { double d = target_push_angle - (current_angle + RIGHT_OFFSET);
-                     while (d > 180) d -= 360; while (d <= -180) d += 360;
-                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 2; } }
-
-        double accel_const = (best == 0) ? MT_ACCEL : (best == 1) ? LT_ACCEL : RT_ACCEL;
-        chosen_power    = fmin(magnitude / accel_const, 1.0);
-        chosen_thruster = best;
-
-        Main_Thruster(0.0); Left_Thruster(0.0); Right_Thruster(0.0);  // no thrust while turning
-        robust_rotate(best_delta, state);   
-        rotating = 1;
-        return;                             
-    } else {
-        if (!robust_rotate_status(state)) return;   // still turning
-        rotating = 0;
-    }
-
-    Main_Thruster (chosen_thruster == 0 ? chosen_power : 0.0);
-    Left_Thruster (chosen_thruster == 1 ? chosen_power : 0.0);
-    Right_Thruster(chosen_thruster == 2 ? chosen_power : 0.0);
-}
-
 double Angle_Robust() {
     double sum = 0;
     for (int i = 0; i < NSAMPLES; i++)
-        sum += normalize_angle(Angle());
+        sum += Angle();
     return sum / NSAMPLES;
 }
 
@@ -416,7 +375,7 @@ void solve_equation_2d(double u[2], double v[2], double a[2], double *t, double 
 
 struct Action{
     enum action_type {THRUST, ROTATE, IDLE} type;
-    double value;    // Rotations in degress 
+    double value;    // Rotations in degress
                      // Or thrust in accelerations
     double duration;     // Duration of Action
                      // Thurst actions will require you to specify how long to thrust for.
@@ -426,7 +385,72 @@ struct Action{
     int is_parallel; // A bool to see if the action can be run in parallel with prev actions. (0 = no, 1 = yes)
 
     // game_state future_state; // A representation of the what the future state "should" look like.
+
+    // robust_thruster's own progress - lives here, per-Action, instead of
+    // static locals, so multiple queued thrust actions each track their
+    // own state independently instead of sharing one hidden global copy.
+    int    chosen_thruster = -1;   // 0 = Main, 1 = Left, 2 = Right
+    double chosen_power    = 0.0;
+    int    rt_phase        = 0;    // 0 = deciding/rotating, 1 = thrusting
 };
+
+
+void robust_thruster(Action &act, struct game_state &state) {
+    double accel_magnitude = act.value;
+
+    // If we already picked a thruster and it's died since (e.g. mid-burn), force a re-pick
+    if (act.chosen_thruster != -1) {
+        int still_ok = (act.chosen_thruster == 0) ? MT_OK
+                      : (act.chosen_thruster == 1) ? LT_OK : RT_OK;
+        if (!still_ok) {
+            act.rt_phase = 0;
+        }
+    }
+
+    if (act.rt_phase == 0) {
+        double target_push_angle = state.angle;
+        const double MAIN_OFFSET = 0.0, LEFT_OFFSET = 90.0, RIGHT_OFFSET = -90.0;
+
+        int best = -1;
+        double best_delta = 0.0, best_abs = 1e9;
+        if (MT_OK) { double d = normalize_angle(target_push_angle - (state.angle + MAIN_OFFSET));
+                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 0; } }
+        if (LT_OK) { double d = normalize_angle(target_push_angle - (state.angle + LEFT_OFFSET));
+                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 1; } }
+        if (RT_OK) { double d = normalize_angle(target_push_angle - (state.angle + RIGHT_OFFSET));
+                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 2; } }
+
+        double accel_const = (best == 0) ? MT_ACCEL : (best == 1) ? LT_ACCEL : RT_ACCEL;
+        act.chosen_power    = fmin(accel_magnitude / accel_const, 1.0);
+        act.chosen_thruster = best;
+
+        if (fabs(best_delta) > ROTATE_TOLERANCE) {
+            Main_Thruster(0.0); Left_Thruster(0.0); Right_Thruster(0.0);  // no thrust while turning
+            robust_rotate(best_delta, state);
+            act.duration += rotate_duration;   // extend the time budget to cover the redirect too
+            act.rt_phase = 2;
+            return;
+        }
+
+        act.rt_phase = 1;
+
+    } else if (act.rt_phase == 2) {
+        if (!robust_rotate_status(state)) return;   // still turning
+        act.rt_phase = 1;
+    }
+
+    // Actually thrusting
+    // project along the direction the ACTIVE thruster pushes
+    const double THRUSTER_OFFSET[3] = {0.0, 90.0, -90.0};
+    double push_angle = state.angle + THRUSTER_OFFSET[act.chosen_thruster];
+    state.accel[0] = act.value * sin(push_angle * PI / 180.0);
+    state.accel[1] = act.value * cos(push_angle * PI / 180.0) - G_ACCEL;
+
+    Main_Thruster (act.chosen_thruster == 0 ? act.chosen_power : 0.0);
+    Left_Thruster (act.chosen_thruster == 1 ? act.chosen_power : 0.0);
+    Right_Thruster(act.chosen_thruster == 2 ? act.chosen_power : 0.0);
+}
+
 class GameControler {
     game_state state;
 
@@ -459,7 +483,7 @@ public:
                 case Action::THRUST:
                     std::cerr << "Thrusting with " << act.value << "\n";
 
-                    Main_Thruster(act.value / MT_ACCEL);
+                    robust_thruster(act, state);
 
                     state.accel[0] = act.value * sin(state.angle * PI / 180.0);
                     state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
@@ -489,7 +513,7 @@ public:
                 switch (act.type){
                     case Action::THRUST:
                         std::cerr << "Stopping thrust\n";
-                        Main_Thruster(0.0);
+                        robust_thruster(act, state);
                         break;
                     case Action::ROTATE:
                         std::cerr << "Rotation completed of " << act.value << "\n";
