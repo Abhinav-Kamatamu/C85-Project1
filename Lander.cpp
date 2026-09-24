@@ -453,6 +453,7 @@ void robust_thruster(Action &act, struct game_state &state) {
 
 class GameControler {
     game_state state;
+    game_state future_state;
 
     
 public:
@@ -514,10 +515,27 @@ public:
                     case Action::THRUST:
                         std::cerr << "Stopping thrust\n";
                         robust_thruster(act, state);
+
+                        std::cerr << "\n\n\n===================================\n";
+                        std::cerr << "After Thrusting\n";
+                        std::cerr << "State Position (" << state.pos[0] << ", " << state.pos[1] << ")\n";
+                        std::cerr << "State Velocity (" << state.vel[0] << ", " << state.vel[1] << ")\n";
+                        std::cerr << "Actual Position (" << Position_X_Robust() << ", " << Position_Y_Robust() << ")\n";
+                        std::cerr << "Actual Velocity (" << Velocity_X_Robust() << ", " << Velocity_Y_Robust() << ")\n";
+                        std::cerr << "=====================================\n\n\n";
                         break;
                     case Action::ROTATE:
                         std::cerr << "Rotation completed of " << act.value << "\n";
                         std::cerr << "Current angle: " << Angle_Robust() << "\n";
+
+                        std::cerr << "\n\n\n===================================\n";
+                        std::cerr << "After rotation\n";
+                        std::cerr << "State Position (" << state.pos[0] << ", " << state.pos[1] << ")\n";
+                        std::cerr << "State Velocity (" << state.vel[0] << ", " << state.vel[1] << ")\n";
+                        std::cerr << "Actual Position (" << Position_X_Robust() << ", " << Position_Y_Robust() << ")\n";
+                        std::cerr << "Actual Velocity (" << Velocity_X_Robust() << ", " << Velocity_Y_Robust() << ")\n";
+                        std::cerr << "=====================================\n\n\n";
+
                         // Do nothing, rotation is a single step command
                         break;
                     case Action::IDLE:
@@ -629,6 +647,7 @@ public:
     void get_initial_state(){
         state.pos[0] = Position_X_Robust();
         state.pos[1] = Position_Y_Robust();
+        std::cerr << "Initial Position: (" << state.pos[0] << ", " << state.pos[1] << ")\n";
         state.vel[0] = Velocity_X_Robust();
         state.vel[1] = Velocity_Y_Robust();
         state.accel[0] = 0;
@@ -643,7 +662,7 @@ public:
         switch(phase){
             case STABILISE:
                 phase = GO_UP;
-                // go_up(state);
+                go_up(future_state);
                 break;
             case GO_UP:
                 phase = GO_HORIZONTAL;
@@ -673,6 +692,9 @@ public:
     }
 
     void stabilise(double target_time) {
+        get_initial_state();
+        future_state = state;
+
         double u[2] = {state.vel[0], state.vel[1]}; // current velocity
         double v[2] = {0.0, 0.0};                   // we want zero
         double required_accel[2] = {0.0, 0.0};
@@ -740,7 +762,6 @@ public:
         solve_equation_2d(v_rot2_end, v_hover_end, zero_accel, &hover_time, s_hover, 'v');
         solve_equation_2d(v_rot2_end, v_hover_end, zero_accel, &hover_time, s_hover, 's');
 
-        game_state future_state = state;
         future_state.vel[0] = v_hover_end[0];
         future_state.vel[1] = v_hover_end[1];
         future_state.accel[0] = 0;
@@ -750,7 +771,17 @@ public:
         future_state.pos[1] -= s_rot1[1] + s[1] + s_rot2[1] + s_hover[1];
         future_state.time += required_angle_time + target_time + required_angle_time_2 + hover_time;
 
-        go_up(future_state);
+        std::cerr << "\n\n\n===================================\n";
+        std::cerr << "Initial Position (" << state.pos[0] << ", " << state.pos[1] << ")\n";
+        std::cerr << "Position after to rotation: (" << state.pos[0] + s_rot1[0] << ", " << state.pos[1] + s_rot1[1] << ")\n";
+        std::cerr << "Position after to thrust: (" << state.pos[0] + s[0] << ", " << state.pos[1] + s[1] << ")\n";
+        std::cerr << "Position after to second rotation: (" << state.pos[0] + s_rot2[0] << ", " << state.pos[1] + s_rot2[1] << ")\n";
+        std::cerr << "Position after to hover: (" << state.pos[0] + s_hover[0] << ", " << state.pos[1] + s_hover[1] << ")\n";
+        std::cerr << "Final Position (" << future_state.pos[0] << ", " << future_state.pos[1] << ")\n";
+        std::cerr << "Final Velocity (" << future_state.vel[0] << ", " << future_state.vel[1] << ")\n";
+        std::cerr << "Final Acceleration (" << future_state.accel[0] << ", " << future_state.accel[1] << ")\n";
+        std::cerr << "Final Angle (" << future_state.angle << ")\n";
+        std::cerr << "=====================================\n\n\n";
     }
 
     void go_up(game_state state) {
@@ -810,7 +841,7 @@ public:
         t2 = fmax(t2, 0.0);
 
         std::cerr << "Going to hover height: " << hover_height << " from current height: " << state.pos[1] << "\n";
-        std::cerr << "Currently we are at height: " << Position_Y_Robust() << "\n\n\n";
+        std::cerr << "Currently we are at Position: (" << Position_X_Robust() << ", " << Position_Y_Robust() << ")\n\n\n";
         std::cerr << "Direction: " << (h >= 0.0 ? "UP" : "DOWN") << "\n";
         std::cerr << "Phase 1 (" << (up_first ? "thrust" : "idle") << "), duration: " << t1 << "\n";
         std::cerr << "Phase 2 (" << (up_first ? "idle" : "thrust") << "), duration: " << t2 << "\n";
