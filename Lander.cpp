@@ -165,19 +165,13 @@
 #include <string.h>
 #include "Lander_Control.h"
 
+#define UP_ACCEL 10
+
 #define FLOATING_TOLERANCE 0.00001f
+#define HOVER_HEIGHT 50
+#define NSAMPLES 60
 
 int a = 1;
-void robust_rotate(double angle) {
-	Rotate(angle);
-}
-
-int safe_posx(double *posx){
-	// We want to return -1 in case of failure.
-	// Ideally, we use some sort of something here to check if Position_X is working correctly over a few samples.
-	*posx = Position_X();
-	return 1;
-}
 
 struct game_state {
 	// int initial = 1;
@@ -189,6 +183,112 @@ struct game_state {
     double time = 0;
 };
 
+double normalize_angle(double a) {
+	while (a > 180.0)   a -= 360.0;
+	while (a <= -180.0) a += 360.0;
+	return a;
+}
+
+#define ROTATE_DELIVERY_RATIO 0.9507   // measured empirically
+// Rotate() consistently delivers ~95.07% of whatever asked
+// took into account Angle sensor noise and rotation time
+
+// We assume single-threaded operation.
+static double rotate_start_time = 0.0;
+static double rotate_duration   = 0.0;
+
+
+void robust_rotate(double delta, struct game_state &state) {
+    if (!isfinite(delta)) return;
+
+    delta = normalize_angle(delta);
+
+    state.angle = normalize_angle(state.angle + delta);
+    // calculated estimate of where we'll end up, the theoretical delta
+
+    double compensated = delta / ROTATE_DELIVERY_RATIO;
+    // overshoot, since we know it delivers ~95% of it
+
+    double compensated_rad = fabs(compensated) * PI / 180.0;
+    rotate_duration   = (compensated_rad / MAX_ROT_RATE) * T_STEP;
+    rotate_start_time = state.time;
+
+    Rotate(compensated);
+}
+
+// Returns 1 once enough simulated time has passed for the most recent
+// robust_rotate call to physically finish, 0 while still waiting. 
+// Just timing, no sensor involved
+int robust_rotate_status(struct game_state &state) {
+    return (state.time - rotate_start_time >= rotate_duration) ? 1 : 0;
+}
+
+
+void robust_thruster(double accel_x, double accel_y, struct game_state &state) {
+
+    static int    rotating        = 0;
+    static int    chosen_thruster = -1;   // 0 = Main, 1 = Left, 2 = Right
+    static double chosen_power    = 0.0;
+
+    double magnitude = sqrt(accel_x * accel_x + accel_y * accel_y);
+    if (magnitude < 1e-6) {
+        Main_Thruster(0.0); Left_Thruster(0.0); Right_Thruster(0.0);
+        rotating = 0;
+        return;
+    }
+
+    if (!rotating) {
+        double target_push_angle = atan2(accel_x, -accel_y) * (180.0 / PI);
+        const double MAIN_OFFSET = 0.0, LEFT_OFFSET = 90.0, RIGHT_OFFSET = -90.0;
+        double current_angle = state.angle;   // from game state
+
+        // Checks for thruster availability and finds the one that is closest to the target angle
+        int best = -1;
+        double best_delta = 0.0, best_abs = 1e9;
+        if (MT_OK) { double d = target_push_angle - (current_angle + MAIN_OFFSET);
+                     while (d > 180) d -= 360; while (d <= -180) d += 360;
+                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 0; } }
+        if (LT_OK) { double d = target_push_angle - (current_angle + LEFT_OFFSET);
+                     while (d > 180) d -= 360; while (d <= -180) d += 360;
+                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 1; } }
+        if (RT_OK) { double d = target_push_angle - (current_angle + RIGHT_OFFSET);
+                     while (d > 180) d -= 360; while (d <= -180) d += 360;
+                     if (fabs(d) < best_abs) { best_abs = fabs(d); best_delta = d; best = 2; } }
+
+        double accel_const = (best == 0) ? MT_ACCEL : (best == 1) ? LT_ACCEL : RT_ACCEL;
+        chosen_power    = fmin(magnitude / accel_const, 1.0);
+        chosen_thruster = best;
+
+        Main_Thruster(0.0); Left_Thruster(0.0); Right_Thruster(0.0);  // no thrust while turning
+        robust_rotate(best_delta, state);   
+        rotating = 1;
+        return;                             
+    } else {
+        if (!robust_rotate_status(state)) return;   // still turning
+        rotating = 0;
+    }
+
+    Main_Thruster (chosen_thruster == 0 ? chosen_power : 0.0);
+    Left_Thruster (chosen_thruster == 1 ? chosen_power : 0.0);
+    Right_Thruster(chosen_thruster == 2 ? chosen_power : 0.0);
+}
+
+double Angle_Robust() {
+    double sum = 0;
+    for (int i = 0; i < NSAMPLES; i++)
+        sum += Angle();
+    return sum / NSAMPLES;
+}
+
+int safe_posx(double *posx){
+	// We want to return -1 in case of failure.
+	// Ideally, we use some sort of something here to check if Position_X is working correctly over a few samples.
+	*posx = Position_X();
+	return 1;
+}
+
+
+
 void print_state(game_state &state){
         std::cerr << "Position: (" << state.pos[0] << ", " << state.pos[1] << ")\n";
         std::cerr << "Real Position: (" << Position_X() << ", " << Position_Y() << ")\n";
@@ -196,7 +296,7 @@ void print_state(game_state &state){
         std::cerr << "Real Velocity: (" << Velocity_X() << ", " << Velocity_Y() << ")\n";
         std::cerr << "Acceleration: (" << state.accel[0] << ", " << state.accel[1] << ")\n";
         std::cerr << "Angle: " << state.angle << "\n";
-        std::cerr << "Real Angle: " << (Angle() > 180 ? Angle() - 360 : Angle()) << "\n";
+        std::cerr << "Real Angle: " << (Angle_Robust() > 180 ? Angle_Robust() - 360 : Angle_Robust()) << "\n";
         std::cerr << "Time: " << state.time << "\n";
         printf("\033[%dA", 8);
     }
@@ -291,7 +391,7 @@ void solve_equation_2d(double u[2], double v[2], double a[2], double *t, double 
 
 
 struct Action{
-    enum action_type {THRUST, ROTATE} type;
+    enum action_type {THRUST, ROTATE, IDLE} type;
     double value;    // Rotations in degress 
                      // Or thrust in accelerations
     double duration;     // Duration of Action
@@ -339,7 +439,10 @@ public:
                     break;
                 case Action::ROTATE:
                     std::cerr << "Rotating with " << act.value << "\n";
-                    robust_rotate(act.value);
+                    robust_rotate(act.value, state);
+                    break;
+                case Action::IDLE:
+                    std::cerr << "Idling for " << act.duration << "\n";
                     break;
             }
         }
@@ -356,8 +459,11 @@ public:
                         break;
                     case Action::ROTATE:
                         std::cerr << "Rotation completed of " << act.value << "\n";
-                        std::cerr << "Current angle: " << Angle() << "\n";
+                        std::cerr << "Current angle: " << Angle_Robust() << "\n";
                         // Do nothing, rotation is a single step command
+                        break;
+                    case Action::IDLE:
+                        std::cerr << "Idle completed\n";
                         break;
                 }
             }
@@ -370,26 +476,38 @@ public:
                         state.accel[0] = act.value * sin(state.angle * PI / 180.0);
                         state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
                         state.vel[0] += state.accel[0] * T_STEP;
-                        state.vel[1] += state.accel[1] * T_STEP;
+                        state.vel[1] -= state.accel[1] * T_STEP; // Subtract to account for flipped coordinates
                         state.pos[0] += state.vel[0] * T_STEP;
-                        state.pos[1] += state.vel[1] * T_STEP;
+                        state.pos[1] -= state.vel[1] * T_STEP;   // Same here
                         break;
                     case Action::ROTATE:
                         // Angles will be stored between -180 and 180. 
                         // We will add hte change in rotation expected and see if it is in this range.
                         // If not, we will adjust accordingly.
-                        double angle_change = act.value * (T_STEP / act.duration);
-                        state.angle += angle_change;
-                        // Ensure the angle is within the range [-180, 180]
-                        if (state.angle > 180.0) {
-                            state.angle -= 360.0;
-                        } else if (state.angle < -180.0) {
-                            state.angle += 360.0;
+                        {
+                            double angle_change = act.value * (T_STEP / act.duration);
+                            state.angle += angle_change;
+                            // Ensure the angle is within the range [-180, 180]
+                            if (state.angle > 180.0) {
+                                state.angle -= 360.0;
+                            } else if (state.angle < -180.0) {
+                                state.angle += 360.0;
+                            }
                         }
+                        break;
+                    case Action::IDLE:
+                        // Update the game state variables with only gravity
+                        state.accel[0] = 0.0;
+                        state.accel[1] = -G_ACCEL;
+                        state.vel[0] += state.accel[0] * T_STEP;
+                        state.vel[1] += state.accel[1] * T_STEP;
+                        state.pos[0] += state.vel[0] * T_STEP;
+                        state.pos[1] += state.vel[1] * T_STEP;
                         break;
                 }
             }
             print_state(state);
+            // std::cerr << "XHIST: " << Xhist << "\r";
         }
 
         void clean_completed_actions(){
@@ -447,7 +565,7 @@ public:
         state.vel[1] = Velocity_Y();
         state.accel[0] = 0;
         state.accel[1] = -G_ACCEL;
-        state.angle = Angle();
+        state.angle = Angle_Robust();
         for (int i = 0; i < 36; i++) {
             state.sonar[i] = SONAR_DIST[i];
         }
@@ -481,8 +599,6 @@ public:
         double destination_angle;
         double min_rot_angle;
 
-        game_state future_state = state;
-
         for(int i = 0; i < 10; i++){
             // Itterate simulation steps for time-step accuracy in calculations:
             double u[2] = {state.vel[0], state.vel[1]};
@@ -506,7 +622,7 @@ public:
                                 required_accel[1] * required_accel[1]);
 
         std::cerr << "Thrust magnitude: " << thrust_mag << ";\n Change Angle: " << min_rot_angle << "\n";
-                                //    type  ---------- value ----------- duration ----in_progress
+                                //    type  ---------- value ----------- duration ------- is_parallel
         action_handler.add_action({Action::ROTATE, min_rot_angle, required_angle_time, .is_parallel=0});
         action_handler.add_action({Action::THRUST, thrust_mag, target_time, .is_parallel=0});
 
@@ -514,11 +630,67 @@ public:
         action_handler.add_action({Action::ROTATE, -destination_angle, required_angle_time, .is_parallel=0});
         action_handler.add_action({Action::THRUST, G_ACCEL, 1, .is_parallel=0});
 
-        go_up(5);
+        game_state future_state = state;
+        future_state.vel[0] = 0;
+        future_state.vel[1] = 0;
+        future_state.accel[0] = 0;
+        future_state.accel[1] = -G_ACCEL;
+        future_state.angle = 0;
+        future_state.pos[0] += s[0];
+        future_state.pos[1] += s[1];
+
+        go_up(future_state);
     }
 
-    void go_up(double target_time) {
-        
+    void go_up(game_state state) {
+        /**
+         * Let h be the vertical distance from present postion to the hover height.
+         * We will accelerate for the h1 meters and then coast for the remaining h2 meters.
+         * Acceleration will take t1 time
+         * Coasting will take t2 time
+         * 
+         * Let u be the initial velocity
+         * Let v be the final velocity after the acceleration phase
+         * Let A be the vertical acceleration
+         * 
+         * This means, we solve for the variables t1 and t2 using the following equations:
+         * h1 = u * t1 + 0.5 * (A - G_ACCEL) * t1^2
+         * h2 = v * t2 + 0.5 * (-G_ACCEL) * t2^2
+         * 2gh2 = v^2
+         * v = u + (A - G_ACCEL) * t1
+         * h1 + h2 = h
+         * 
+         * With this we get required v = \sqrt{\frac{ g(u^2 + 2(a - G_ACCEL) h) }{a} }
+         * t1 = \frac{v - u}{a - G_ACCEL}
+         * t2 = \frac{v}{G_ACCEL}
+         * 
+         */
+
+        const double hover_height = HOVER_HEIGHT;
+        double required_accel[2] = {0.0, 0.0};
+        double s[2] = {state.pos[0], hover_height};
+        double u[2] = {state.vel[0], state.vel[1]};
+
+        double dist_to_cover = - (hover_height - state.pos[1]); // Extra -ve cuz up is negative in our coordinate system
+
+        double v[2] = {u[0], u[1]}; // We want to reach the hover height with v_y = 0
+        double t1 = 0; // Time for upward acceleration
+        double t2 = 0; // Time for upward coasting (no thrust, just gravity)
+
+        required_accel[1] = UP_ACCEL;
+
+        v[1] = sqrt((G_ACCEL * (u[1] * u[1] + 2 * (required_accel[1] - G_ACCEL) * dist_to_cover)) / required_accel[1]);
+
+        t1 = (v[1] - u[1]) / (required_accel[1] - G_ACCEL);
+        t2 = v[1] / G_ACCEL;
+
+        std::cerr << "Going up to hover height: " << hover_height << " from current height: " << state.pos[1] << "\n";
+        std::cerr << "Required acceleration: " << required_accel[1] << "\n";
+        std::cerr << "Time for acceleration: " << t1 << "\n";
+        std::cerr << "Time for coasting: " << t2 << "\n";
+
+        action_handler.add_action({Action::THRUST, required_accel[1], t1, .is_parallel=0});
+        action_handler.add_action({Action::IDLE, 0.0, t2, .is_parallel=0});
     }
 
     void tick(){
