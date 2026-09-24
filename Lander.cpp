@@ -175,8 +175,10 @@
 #define MAIN_OFFSET 0.0
 #define LEFT_OFFSET 90.0
 #define RIGHT_OFFSET -90.0
+#define LOWEST_THRUST_RATIO 0.025 // It seems like thrusters never turn off. On average, the thrusers pwoer seems
+                            // to be 2.5% of it's full power using same method as how we found DELIVERY_RATIO
 #define DELIVERY_RATIO 0.95   // Rotate(), Main/Left/Right_Thruster() all deliver 95% of whatever is asked
-                                // (mean 0.94999, median 0.95000 over 292 samples of all controls; linear, no offset)
+                                // (mean 0.94999, median 0.95000 over 292 samples of all controls)
 #define ROTATE_TOLERANCE 3.0   // degrees - skip re-rotating for corrections this small
                                  // (without this, any nonzero residual misalignment
                                  // re-triggers a full rotate cycle and thrust never sustains)
@@ -194,7 +196,7 @@ double normalize_value(double value, NormalizeType type) {
         else if (value <= -180.0)
             value += 360.0;
     } else if (type == Nother) {
-       value = fmin(fmax(value / DELIVERY_RATIO, 0.0), 1.0);
+       value = fmin(fmax((value - LOWEST_THRUST_RATIO) / DELIVERY_RATIO, 0.0), 1.0);
     }
     return value;
 }
@@ -218,13 +220,13 @@ void Robust(void (*Control)(double), double normalized_value) {
 int a = 1;
 
 struct game_state {
-	// int initial = 1;
-	// int initial = 1;
-	double pos[2];
-	double vel[2];
-	double accel[2];
+	double pos[2] = {0};
+	double vel[2] = {0};
+	double accel[2] = {0};
+    int ok[3] = {1, 1, 1};
+    double power[3] = {0}; // Power last sent
+	double sonar[36] = {0};
 	double angle;
-	double sonar[36];
     double time = 0;
 };
 
@@ -248,8 +250,42 @@ void robust_rotate(double delta, struct game_state &state) {
 // Returns 1 once enough simulated time has passed for the most recent
 // robust_rotate call to physically finish, 0 while still waiting.
 // Just timing, no sensor involved
-int robust_rotate_status(struct game_state &state) {
-    return (state.time - rotate_start_time >= rotate_duration) ? 1 : 0;
+int robust_rotate_status(struct game_state* state) {
+    return (state->time - rotate_start_time >= rotate_duration) ? 1 : 0;
+}
+
+void set_thrusters(game_state* state, double main_p, double left_p, double right_p) {
+    Main_Thruster(main_p);
+    Left_Thruster(left_p);
+    Right_Thruster(right_p);
+    state->power[0] = main_p;
+    state->power[1] = left_p;
+    state->power[2] = right_p;
+    state->ok[0] = MT_OK;
+    state->ok[1] = LT_OK;
+    state->ok[2] = RT_OK;
+}
+
+// Expected acceleration from the last command
+void compute_accel(game_state* state) {
+    double m =  state->ok[0] ? DELIVERY_RATIO * state->power[0] + LOWEST_THRUST_RATIO : 0.0;
+    double l =  state->ok[1] ? DELIVERY_RATIO * state->power[1] + LOWEST_THRUST_RATIO : 0.0;
+    double r =  state->ok[2] ? DELIVERY_RATIO * state->power[2] + LOWEST_THRUST_RATIO : 0.0;
+    double s = sin(state->angle * PI / 180.0), c = cos(state->angle * PI / 180.0);
+    state->accel[0] = MT_ACCEL * m * s + LT_ACCEL * l * c - RT_ACCEL * r * c;
+    state->accel[1] = MT_ACCEL * m * c - LT_ACCEL * l * s + RT_ACCEL * r * s - G_ACCEL;
+}
+
+// Average acceleration with all thrusters commanded to 0
+void coast_accel(double angle, double out[2]) {
+    game_state tmp;
+    tmp.angle = angle;
+    tmp.ok[0] = MT_OK;
+    tmp.ok[1] = LT_OK;
+    tmp.ok[2] = RT_OK;
+    compute_accel(&tmp);
+    out[0] = tmp.accel[0];
+    out[1] = tmp.accel[1];
 }
 
 void print_state(game_state &state){
@@ -257,7 +293,7 @@ void print_state(game_state &state){
         fprintf(fp, "\r\033[%dA\r\033[2K", 12);
         fprintf(fp, "Position: (%.2f, %.2f)\n", state.pos[0], state.pos[1]);
         fprintf(fp, "Real Position: (%.2f, %.2f)\n", Robust(Position_X), Robust(Position_Y));
-        fprintf(fp, "Position off by (%): %.2f\n\n\n\n", fsqrt((state.pos[0] - Robust(Position_X)) * (state.pos[0] - Robust(Position_X)) + (state.pos[1] - Robust(Position_Y)) * (state.pos[1] - Robust(Position_Y))) / fsqrt(state.pos[0] * state.pos[0] + state.pos[1] * state.pos[1]) * 100);
+        fprintf(fp, "Position off by (%%): %.2f\n\n\n\n", fsqrt((state.pos[0] - Robust(Position_X)) * (state.pos[0] - Robust(Position_X)) + (state.pos[1] - Robust(Position_Y)) * (state.pos[1] - Robust(Position_Y))) / fsqrt(state.pos[0] * state.pos[0] + state.pos[1] * state.pos[1]) * 100);
         fprintf(fp, "Velocity: (%.2f, %.2f)\n", state.vel[0], state.vel[1]);
         fprintf(fp, "Real Velocity: (%.2f, %.2f)\n", Robust(Velocity_X), Robust(Velocity_Y));
         fprintf(fp, "Acceleration: (%.2f, %.2f)\n", state.accel[0], state.accel[1]);
@@ -379,7 +415,7 @@ struct Action{
 
 
 void robust_thruster(Action &act, struct game_state &state) {
-    double accel_magnitude = act.value;
+    //double accel_magnitude = act.value;
 
     // If we already picked a thruster and it's died since (e.g. mid-burn), force a re-pick
     if (act.chosen_thruster != -1) {
@@ -400,6 +436,7 @@ void robust_thruster(Action &act, struct game_state &state) {
                 best_abs = fabs(d);
                 best_delta = d;
                 best = 0;
+                act.chosen_power = normalize_value(act.value / MT_ACCEL, Nother); 
             }
         }
         if (LT_OK) {
@@ -408,6 +445,7 @@ void robust_thruster(Action &act, struct game_state &state) {
                 best_abs = fabs(d);
                 best_delta = d;
                 best = 1;
+                act.chosen_power = normalize_value(act.value / LT_ACCEL, Nother); 
             }
         }
         if (RT_OK) {
@@ -416,17 +454,14 @@ void robust_thruster(Action &act, struct game_state &state) {
                 best_abs = fabs(d);
                 best_delta = d;
                 best = 2;
+                act.chosen_power = normalize_value(act.value / RT_ACCEL, Nother); 
             }
         }
 
-        double accel_const = (best == 0) ? MT_ACCEL : (best == 1) ? LT_ACCEL : RT_ACCEL;
-        act.chosen_power    = fmin(accel_magnitude / accel_const, 1.0);
         act.chosen_thruster = best;
 
         if (fabs(best_delta) > ROTATE_TOLERANCE) {
-            Main_Thruster(0.0);
-            Left_Thruster(0.0);
-            Right_Thruster(0.0);  // no thrust while turning
+            set_thrusters(&state, 0, 0, 0);  // no thrust while turning
             robust_rotate(best_delta, state);
             act.duration += rotate_duration;   // extend the time budget to cover the redirect too
             act.rt_phase = 2;
@@ -436,20 +471,18 @@ void robust_thruster(Action &act, struct game_state &state) {
         act.rt_phase = 1;
 
     } else if (act.rt_phase == 2) {
-        if (!robust_rotate_status(state)) return;   // still turning
+        if (!robust_rotate_status(&state)) return;   // still turning
         act.rt_phase = 1;
     }
 
-    // Actually thrusting
-    // project along the direction the ACTIVE thruster pushes
-    const double THRUSTER_OFFSET[3] = {0.0, 90.0, -90.0};
-    double push_angle = state.angle + THRUSTER_OFFSET[act.chosen_thruster];
-    state.accel[0] = act.value * sin(push_angle * PI / 180.0);
-    state.accel[1] = act.value * cos(push_angle * PI / 180.0) - G_ACCEL;
+    // Actually thrusting along direction of working thruster
+    set_thrusters(
+        &state,
+        act.chosen_thruster == 0 ? act.chosen_power : 0.0,
+        act.chosen_thruster == 1 ? act.chosen_power : 0.0,
+        act.chosen_thruster == 2 ? act.chosen_power : 0.0
+    );
 
-    Main_Thruster(act.chosen_thruster == 0 ? act.chosen_power : 0.0);
-    Left_Thruster(act.chosen_thruster == 1 ? act.chosen_power : 0.0);
-    Right_Thruster(act.chosen_thruster == 2 ? act.chosen_power : 0.0);
 }
 
 class GameControler {
@@ -484,19 +517,10 @@ public:
             switch (act.type){
                 case Action::THRUST:
                     std::cerr << "Thrusting with " << act.value << "\n";
-
-                    robust_thruster(act, state);
-
-                    state.accel[0] = act.value * sin(state.angle * PI / 180.0);
-                    state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
-                    
+                    robust_thruster(act, state);                    
                     break;
                 case Action::ROTATE:
                     std::cerr << "Rotating with " << act.value << "\n";
-
-                    state.accel[0] = 0.0;
-                    state.accel[1] = -G_ACCEL;
-
                     robust_rotate(act.value, state);
                     act.duration = rotate_duration; // Update the duration of the action to match the rotation time
                     break;
@@ -504,7 +528,6 @@ public:
                     std::cerr << "Idling for " << act.duration << "\n";
                     break;
             }
-            process_state_updates(state);
         }
 
         void continue_action(Action &act, game_state &state){
@@ -515,9 +538,7 @@ public:
                 switch (act.type){
                     case Action::THRUST:
                         std::cerr << "Stopping thrust\n";
-                        Main_Thruster(0.0);
-                        Left_Thruster(0.0);
-                        Right_Thruster(0.0);
+                        set_thrusters(&state, 0, 0, 0);
                         // robust_thruster(act, state);
 
                         std::cerr << "\n\n\n===================================\n";
@@ -554,16 +575,13 @@ public:
             else{
                 switch (act.type){
                     case Action::THRUST:
-                        // Update the game state variables
-                        state.accel[0] = act.value * sin(state.angle * PI / 180.0);
-                        state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
+                        robust_thruster(act, state);
                         break;
                     case Action::ROTATE:
                         // Angles will be stored between -180 and 180. 
                         // We will add hte change in rotation expected and see if it is in this range.
                         // If not, we will adjust accordingly.
                         {
-                            double angle_change = act.value * (T_STEP / act.duration);
                             // state.angle += angle_change;
                             // Ensure the angle is within the range [-180, 180]
                             if (state.angle > 180.0) {
@@ -574,9 +592,6 @@ public:
                         }
                         break;
                     case Action::IDLE:
-                        // Update the game state variables with only gravity
-                        state.accel[0] = 0.0;
-                        state.accel[1] = -G_ACCEL;
                         break;
                 }
             }
@@ -594,7 +609,7 @@ public:
         }
 
         void process_state_updates(game_state &state){
-            // Update the game state variables with only gravity
+            // Integrate one step using accel from compute_accel
             state.vel[0] += state.accel[0] * T_STEP;
             state.vel[1] += state.accel[1] * T_STEP;
             state.pos[0] += state.vel[0] * T_STEP * S_SCALE;
@@ -602,11 +617,10 @@ public:
         }
 
         void run_actions(game_state &state){
+            compute_accel(&state);
+            process_state_updates(state);
+            set_thrusters(&state, 0, 0, 0);
             int detected_all_completed = 1;
-
-            // Reset acceleration to gravity only before processing actions
-            state.accel[0] = 0.0;
-            state.accel[1] = -G_ACCEL;
 
             for (Action &act : act_bck){
                 switch (is_running){
@@ -629,11 +643,8 @@ public:
                 }
             }
 
-            process_state_updates(state);
-
-            if (detected_all_completed) {
+            if (detected_all_completed)
                 is_running = 0;
-            }
             clean_completed_actions();
         }
 
@@ -666,7 +677,7 @@ public:
         switch(phase){
             case STABILISE:
                 phase = GO_UP;
-                go_up(future_state);
+                go_up(state);
                 break;
             case GO_UP:
                 phase = GO_HORIZONTAL;
@@ -691,12 +702,11 @@ public:
             } else if (diff > 180.0){
                 diff -= 360.0;
             }
-
             return diff;
     }
 
     void stabilise(double target_time) {
-        get_initial_state();
+        //get_initial_state();
         future_state = state;
 
         double u[2] = {state.vel[0], state.vel[1]}; // current velocity
@@ -710,13 +720,14 @@ public:
         double thrust_mag;
         double required_angle_time;
         double destination_angle;
-        double min_rot_angle;
+        double min_rot_angle = 0.0;
 
         for(int i = 0; i < 10; i++){
             // Itterate simulation steps for time-step accuracy in calculations:
             double u_after[2];
             memset(required_accel, 0, sizeof(required_accel));
-            
+            // Update the accelerations, account for our ratios for thust
+            coast_accel(state.angle + min_rot_angle / 2.0, G_accel);
             solve_equation_2d(u, u_after, G_accel, &time_offset, s, 'v'); // Account for effect of gravity on u while rotating
             solve_equation_2d(u_after, v, required_accel, &target_time, s, 'a'); // Calculate the required thrust acceleration
             solve_equation_2d(u_after, v, required_accel, &target_time, s, 's'); // Calculate the distance travelled
@@ -754,11 +765,13 @@ public:
         solve_equation_2d(u, u_rot1_end, G_accel, &required_angle_time, s_rot1, 's');
 
         // second rotation, starting from rest, free fall
+        double G_accel_2[2];
         double v_rot2_end[2];
         double s_rot2[2];
-        solve_equation_2d(v, v_rot2_end, G_accel, &required_angle_time_2, s_rot2, 'v');
-        solve_equation_2d(v, v_rot2_end, G_accel, &required_angle_time_2, s_rot2, 's');
-
+        coast_accel(destination_angle / 2.0, G_accel_2);
+        solve_equation_2d(v, v_rot2_end, G_accel_2, &required_angle_time_2, s_rot2, 'v');
+        solve_equation_2d(v, v_rot2_end, G_accel_2, &required_angle_time_2, s_rot2, 's');
+        
         // velocity from rotation 2 is carried through
         double zero_accel[2] = {0.0, 0.0};
         double v_hover_end[2];
@@ -797,20 +810,35 @@ public:
          * 
          * Let u be the initial velocity
          * Let v be the final velocity after the acceleration phase
-         * Let A be the vertical acceleration
-         * 
-         * This means, we solve for the variables t1 and t2 using the following equations:
-         * h1 = u * t1 + 0.5 * (A - G_ACCEL) * t1^2
-         * h2 = v * t2 + 0.5 * (-G_ACCEL) * t2^2
-         * 2gh2 = v^2
-         * v = u + (A - G_ACCEL) * t1
+         * Let A be the thrust acceleration we ask for (delivered exactly, via normalize_value)
+         * Let G = G_ACCEL
+         * Let Gc be the effective gravity while coasting. The thrusters never fully turn
+         *   off (LOWEST_THRUST_RATIO), so coasting decelerates at less than G.
+         *   Gc = -coast_accel(angle)[1], ~7.995 upright with the main thruster OK.
+         *
+         * Going UP (thrust, then coast):
+         * h1 = u * t1 + 0.5 * (A - G) * t1^2
+         * h2 = v * t2 - 0.5 * Gc * t2^2
+         * v = u + (A - G) * t1
+         * v^2 = 2 * Gc * h2
          * h1 + h2 = h
-         * 
-         * With this we get required v = \sqrt{\frac{ g(u^2 + 2(a - G_ACCEL) h) }{a} }
-         * t1 = \frac{v - u}{a - G_ACCEL}
-         * t2 = \frac{v}{G_ACCEL}
-         * 
+         *
+         * Substituting h1 = (v^2 - u^2) / (2(A - G)) and h2 = v^2 / (2 Gc) into h1 + h2 = h:
+         * v  = \sqrt{\frac{ Gc (u^2 + 2(A - G) h) }{ A - G + Gc } }
+         * t1 = \frac{v - u}{A - G}
+         * t2 = \frac{v}{Gc}
+         * (With Gc = G this reduces to the ideal v = \sqrt{ G(u^2 + 2(A - G)h) / A }.)
+         *
+         * Going DOWN (coast, then thrust), with d = -h, u_d = -u (down-positive):
+         * v_d = \sqrt{\frac{ (A - G)(u_d^2 + 2 Gc d) }{ A - G + Gc } }
+         * t1  = \frac{v_d - u_d}{Gc}
+         * t2  = \frac{v_d}{A - G}
+         *
          */
+
+        double coast[2];
+        coast_accel(0.0, coast);          // upright after stabilise
+        const double Gc = -coast[1];      // costing gravity
 
         const double hover_height = HOVER_HEIGHT;
         const double A = UP_ACCEL;   // How fast do we want to go up?
@@ -826,16 +854,16 @@ public:
 
         if (h >= 0.0) {
             // Need to go UP.
-            v  = sqrt((G * (u * u + 2 * (A - G) * h)) / A);
+            v  = sqrt((Gc * (u * u + 2 * (A - G) * h)) / (A - G + Gc));
             t1 = (v - u) / (A - G);
-            t2 = v / G;
+            t2 = v / Gc;
             up_first = true;
         } else {
             // Need to go DOWN.
             double dist_down = -h;
             double u_down    = -u;
-            double v_down    = sqrt(((A - G) * (u_down * u_down + 2 * G * dist_down)) / A);
-            t1 = (v_down - u_down) / G;
+            double v_down = sqrt(((A - G) * (u_down * u_down + 2 * Gc * dist_down)) / (A - G + Gc));
+            t1 = (v_down - u_down) / Gc;
             t2 = v_down / (A - G);
             up_first = false;
         }
