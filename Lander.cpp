@@ -476,9 +476,9 @@ public:
                         state.accel[0] = act.value * sin(state.angle * PI / 180.0);
                         state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
                         state.vel[0] += state.accel[0] * T_STEP;
-                        state.vel[1] -= state.accel[1] * T_STEP; // Subtract to account for flipped coordinates
+                        state.vel[1] += state.accel[1] * T_STEP;
                         state.pos[0] += state.vel[0] * T_STEP;
-                        state.pos[1] -= state.vel[1] * T_STEP;   // Same here
+                        state.pos[1] -= state.vel[1] * T_STEP;  // Subtract to account for flipped coordinates
                         break;
                     case Action::ROTATE:
                         // Angles will be stored between -180 and 180. 
@@ -502,7 +502,7 @@ public:
                         state.vel[0] += state.accel[0] * T_STEP;
                         state.vel[1] += state.accel[1] * T_STEP;
                         state.pos[0] += state.vel[0] * T_STEP;
-                        state.pos[1] += state.vel[1] * T_STEP;
+                        state.pos[1] -= state.vel[1] * T_STEP; // Subtract to account for flipped coordinates
                         break;
                 }
             }
@@ -637,7 +637,7 @@ public:
         future_state.accel[1] = -G_ACCEL;
         future_state.angle = 0;
         future_state.pos[0] += s[0];
-        future_state.pos[1] += s[1];
+        future_state.pos[1] -= s[1];
 
         go_up(future_state);
     }
