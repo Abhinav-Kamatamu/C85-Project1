@@ -168,7 +168,7 @@
 #define UP_ACCEL 10
 
 #define FLOATING_TOLERANCE 0.00001f
-#define HOVER_HEIGHT 50
+#define HOVER_HEIGHT 70
 #define NSAMPLES 60
 
 int a = 1;
@@ -280,25 +280,49 @@ double Angle_Robust() {
     return sum / NSAMPLES;
 }
 
-int safe_posx(double *posx){
-	// We want to return -1 in case of failure.
-	// Ideally, we use some sort of something here to check if Position_X is working correctly over a few samples.
-	*posx = Position_X();
-	return 1;
+double Position_X_Robust() {
+    double sum = 0;
+    for (int i = 0; i < NSAMPLES; i++)
+        sum += Position_X();
+    return sum / NSAMPLES;
+}
+
+double Position_Y_Robust() {
+    double sum = 0;
+    for (int i = 0; i < NSAMPLES; i++)
+        sum += Position_Y();
+    return sum / NSAMPLES;
+}
+
+double Velocity_X_Robust() {
+    double sum = 0;
+    for (int i = 0; i < NSAMPLES; i++)
+        sum += Velocity_X();
+    return sum / NSAMPLES;
+}
+
+double Velocity_Y_Robust() {
+    double sum = 0;
+    for (int i = 0; i < NSAMPLES; i++)
+        sum += Velocity_Y();
+    return sum / NSAMPLES;
 }
 
 
 
 void print_state(game_state &state){
-        std::cerr << "Position: (" << state.pos[0] << ", " << state.pos[1] << ")\n";
-        std::cerr << "Real Position: (" << Position_X() << ", " << Position_Y() << ")\n";
-        std::cerr << "Velocity: (" << state.vel[0] << ", " << state.vel[1] << ")\n";
-        std::cerr << "Real Velocity: (" << Velocity_X() << ", " << Velocity_Y() << ")\n";
-        std::cerr << "Acceleration: (" << state.accel[0] << ", " << state.accel[1] << ")\n";
-        std::cerr << "Angle: " << state.angle << "\n";
-        std::cerr << "Real Angle: " << (Angle_Robust() > 180 ? Angle_Robust() - 360 : Angle_Robust()) << "\n";
-        std::cerr << "Time: " << state.time << "\n";
-        printf("\033[%dA", 8);
+    static FILE *fp = fopen("lander_state.txt", "w");
+        fprintf(fp, "\r\033[%dA\r\033[2K", 12);
+        fprintf(fp, "Position: (%.2f, %.2f)\n", state.pos[0], state.pos[1]);
+        fprintf(fp, "Real Position: (%.2f, %.2f)\n", Position_X_Robust(), Position_Y_Robust());
+        fprintf(fp, "Position off by (%): %.2f\n\n\n\n", fsqrt((state.pos[0] - Position_X_Robust()) * (state.pos[0] - Position_X_Robust()) + (state.pos[1] - Position_Y_Robust()) * (state.pos[1] - Position_Y_Robust())) / fsqrt(state.pos[0] * state.pos[0] + state.pos[1] * state.pos[1]) * 100);
+        fprintf(fp, "Velocity: (%.2f, %.2f)\n", state.vel[0], state.vel[1]);
+        fprintf(fp, "Real Velocity: (%.2f, %.2f)\n", Velocity_X_Robust(), Velocity_Y_Robust());
+        fprintf(fp, "Acceleration: (%.2f, %.2f)\n", state.accel[0], state.accel[1]);
+        fprintf(fp, "Angle: %.2f\n", state.angle);
+        fprintf(fp, "Real Angle: %.2f\n", (Angle_Robust() > 180 ? Angle_Robust() - 360 : Angle_Robust()));
+        fprintf(fp, "Time: %.2f\n", state.time);
+        fflush(fp);
     }
 
 void solve_equation_1d(double *u, double *v, double *a, double *t, double *s, char which) {
@@ -310,18 +334,18 @@ void solve_equation_1d(double *u, double *v, double *a, double *t, double *s, ch
 	switch (which){
 		case 'v':
 			if (t == nullptr) {
-	            *v = fsqrt((*u) * (*u) + 2 * (*a) * (*s));
+	            *v = copysign(fsqrt((*u) * (*u) + 2 * (*a) * (*s)), *s);
 			} else {
 				*v = *u + *a * *t;
 			}
 			break;
 		case 'u':
 			if (t == nullptr) {
-				*u = fsqrt((*v) * (*v) - 2 * (*a) * (*s));
+				*u = copysign(fsqrt((*v) * (*v) - 2 * (*a) * (*s)), *s);
 			} else {
 				*u = *v - *a * *t;
 			}
-			break;
+			break; 
 		case 'a':
 			if (t == nullptr) {
 				*a = ((*v) * (*v) - (*u) * (*u)) / (2 * (*s));
@@ -330,7 +354,7 @@ void solve_equation_1d(double *u, double *v, double *a, double *t, double *s, ch
 			}
 			break;
 		case 't':
-			if (a == nullptr) {
+			if (s == nullptr) {
 				*t = ((*v) - (*u)) / (*a);
 			} else {
 				*t = ((*v) * (*v) - (*u) * (*u)) / (2 * (*a) * (*s));
@@ -397,7 +421,7 @@ struct Action{
     double duration;     // Duration of Action
                      // Thurst actions will require you to specify how long to thrust for.
     int in_progress; // A bool to see if the action is running. (0 = not started, 1 = in progress, 2 = completed)
-    int start_time;
+    double start_time;
 
     int is_parallel; // A bool to see if the action can be run in parallel with prev actions. (0 = no, 1 = yes)
 
@@ -436,15 +460,25 @@ public:
                     std::cerr << "Thrusting with " << act.value << "\n";
 
                     Main_Thruster(act.value / MT_ACCEL);
+
+                    state.accel[0] = act.value * sin(state.angle * PI / 180.0);
+                    state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
+                    
                     break;
                 case Action::ROTATE:
                     std::cerr << "Rotating with " << act.value << "\n";
+
+                    state.accel[0] = 0.0;
+                    state.accel[1] = -G_ACCEL;
+
                     robust_rotate(act.value, state);
+                    act.duration = rotate_duration; // Update the duration of the action to match the rotation time
                     break;
                 case Action::IDLE:
                     std::cerr << "Idling for " << act.duration << "\n";
                     break;
             }
+            process_state_updates(state);
         }
 
         void continue_action(Action &act, game_state &state){
@@ -464,6 +498,8 @@ public:
                         break;
                     case Action::IDLE:
                         std::cerr << "Idle completed\n";
+                        std::cerr << "Current velocity: (" << Velocity_X_Robust() << ", " << Velocity_Y_Robust() << ")\n";
+                        std::cerr << "Current state velocity: (" << state.vel[0] << ", " << state.vel[1] << ")\n";
                         break;
                 }
             }
@@ -475,10 +511,6 @@ public:
                         // Update the game state variables
                         state.accel[0] = act.value * sin(state.angle * PI / 180.0);
                         state.accel[1] = act.value * cos(state.angle * PI / 180.0) - G_ACCEL;
-                        state.vel[0] += state.accel[0] * T_STEP;
-                        state.vel[1] += state.accel[1] * T_STEP;
-                        state.pos[0] += state.vel[0] * T_STEP;
-                        state.pos[1] -= state.vel[1] * T_STEP;  // Subtract to account for flipped coordinates
                         break;
                     case Action::ROTATE:
                         // Angles will be stored between -180 and 180. 
@@ -486,7 +518,7 @@ public:
                         // If not, we will adjust accordingly.
                         {
                             double angle_change = act.value * (T_STEP / act.duration);
-                            state.angle += angle_change;
+                            // state.angle += angle_change;
                             // Ensure the angle is within the range [-180, 180]
                             if (state.angle > 180.0) {
                                 state.angle -= 360.0;
@@ -499,10 +531,6 @@ public:
                         // Update the game state variables with only gravity
                         state.accel[0] = 0.0;
                         state.accel[1] = -G_ACCEL;
-                        state.vel[0] += state.accel[0] * T_STEP;
-                        state.vel[1] += state.accel[1] * T_STEP;
-                        state.pos[0] += state.vel[0] * T_STEP;
-                        state.pos[1] -= state.vel[1] * T_STEP; // Subtract to account for flipped coordinates
                         break;
                 }
             }
@@ -519,8 +547,21 @@ public:
             }
         }
 
+        void process_state_updates(game_state &state){
+            // Update the game state variables with only gravity
+            state.vel[0] += state.accel[0] * T_STEP;
+            state.vel[1] += state.accel[1] * T_STEP;
+            state.pos[0] += state.vel[0] * T_STEP;
+            state.pos[1] -= state.vel[1] * T_STEP;  // Subtract to account for flipped coordinates
+        }
+
         void run_actions(game_state &state){
             int detected_all_completed = 1;
+
+            // Reset acceleration to gravity only before processing actions
+            state.accel[0] = 0.0;
+            state.accel[1] = -G_ACCEL;
+
             for (Action &act : act_bck){
                 switch (is_running){
                     case 0:
@@ -542,6 +583,8 @@ public:
                 }
             }
 
+            process_state_updates(state);
+
             if (detected_all_completed) {
                 is_running = 0;
             }
@@ -551,6 +594,7 @@ public:
     };
 
     ActionHandler action_handler;
+    enum Phase {STABILISE, GO_UP, GO_HORIZONTAL, GO_DOWN} phase = STABILISE;
 
     GameControler(){
         get_initial_state();
@@ -559,10 +603,10 @@ public:
     }
 
     void get_initial_state(){
-        safe_posx(&(state.pos[0]));
-        state.pos[1] = Position_Y();
-        state.vel[0] = Velocity_X();
-        state.vel[1] = Velocity_Y();
+        state.pos[0] = Position_X_Robust();
+        state.pos[1] = Position_Y_Robust();
+        state.vel[0] = Velocity_X_Robust();
+        state.vel[1] = Velocity_Y_Robust();
         state.accel[0] = 0;
         state.accel[1] = -G_ACCEL;
         state.angle = Angle_Robust();
@@ -571,6 +615,25 @@ public:
         }
     }
 
+    void next_phase(){
+        switch(phase){
+            case STABILISE:
+                phase = GO_UP;
+                go_up(state);
+                break;
+            case GO_UP:
+                phase = GO_HORIZONTAL;
+                // go_horizontal(state);
+                break;
+            case GO_HORIZONTAL:
+                phase = GO_DOWN;
+                // go_down(state);
+                break;
+            case GO_DOWN: // I don't think we will ever reach this phase...
+                phase = GO_DOWN;
+                break;
+        }
+    }
     
 
     double find_min_travel_angle(double required_angle, double state_angle){
@@ -601,12 +664,12 @@ public:
 
         for(int i = 0; i < 10; i++){
             // Itterate simulation steps for time-step accuracy in calculations:
-            double u[2] = {state.vel[0], state.vel[1]};
+            double u_after[2];
             memset(required_accel, 0, sizeof(required_accel));
             
-            solve_equation_2d(u, u, G_accel, &time_offset, s, 'u'); // Account for effect of gravity on u while rotating
-            solve_equation_2d(u, v, required_accel, &target_time, s, 'a'); // Calculate the required thrust acceleration
-            solve_equation_2d(u, v, required_accel, &target_time, s, 's'); // Calculate the distance travelled
+            solve_equation_2d(u, u_after, G_accel, &time_offset, s, 'v'); // Account for effect of gravity on u while rotating
+            solve_equation_2d(u_after, v, required_accel, &target_time, s, 'a'); // Calculate the required thrust acceleration
+            solve_equation_2d(u_after, v, required_accel, &target_time, s, 's'); // Calculate the distance travelled
 
             required_accel[1] += G_ACCEL; // thruster must also cancel gravity and kill vel.
 
@@ -639,7 +702,7 @@ public:
         future_state.pos[0] += s[0];
         future_state.pos[1] -= s[1];
 
-        go_up(future_state);
+        
     }
 
     void go_up(game_state state) {
@@ -667,33 +730,56 @@ public:
          */
 
         const double hover_height = HOVER_HEIGHT;
-        double required_accel[2] = {0.0, 0.0};
-        double s[2] = {state.pos[0], hover_height};
-        double u[2] = {state.vel[0], state.vel[1]};
+        const double A = UP_ACCEL;   // How fast do we want to go up?
+        const double G = G_ACCEL;
 
-        double dist_to_cover = - (hover_height - state.pos[1]); // Extra -ve cuz up is negative in our coordinate system
+        double u = state.vel[1]; // u_y (up-positive)
+        double h = state.pos[1] - hover_height; // Height to move (up-positive)
 
-        double v[2] = {u[0], u[1]}; // We want to reach the hover height with v_y = 0
-        double t1 = 0; // Time for upward acceleration
-        double t2 = 0; // Time for upward coasting (no thrust, just gravity)
+        double v; // velocity after acceleration phase
+        double t1 = 0.0;  // duration of acceleration phase
+        double t2 = 0.0;  // duration of coasting phase
+        bool   up_first;  // true: thrust then idle. false: idle then thrust.
 
-        required_accel[1] = UP_ACCEL;
+        if (h >= 0.0) {
+            // Need to go UP.
+            v  = sqrt((G * (u * u + 2 * (A - G) * h)) / A);
+            t1 = (v - u) / (A - G);
+            t2 = v / G;
+            up_first = true;
+        } else {
+            // Need to go DOWN.
+            double dist_down = -h;
+            double u_down    = -u;
+            double v_down    = sqrt(((A - G) * (u_down * u_down + 2 * G * dist_down)) / A);
+            t1 = (v_down - u_down) / G;
+            t2 = v_down / (A - G);
+            up_first = false;
+        }
 
-        v[1] = sqrt((G_ACCEL * (u[1] * u[1] + 2 * (required_accel[1] - G_ACCEL) * dist_to_cover)) / required_accel[1]);
+        // Just to be safe. Never can be sure about quadratics ;(
+        t1 = fmax(t1, 0.0);
+        t2 = fmax(t2, 0.0);
 
-        t1 = (v[1] - u[1]) / (required_accel[1] - G_ACCEL);
-        t2 = v[1] / G_ACCEL;
+        std::cerr << "Going to hover height: " << hover_height << " from current height: " << state.pos[1] << "\n";
+        std::cerr << "Currently we are at height: " << Position_Y_Robust() << "\n\n\n";
+        std::cerr << "Direction: " << (h >= 0.0 ? "UP" : "DOWN") << "\n";
+        std::cerr << "Phase 1 (" << (up_first ? "thrust" : "idle") << "), duration: " << t1 << "\n";
+        std::cerr << "Phase 2 (" << (up_first ? "idle" : "thrust") << "), duration: " << t2 << "\n";
 
-        std::cerr << "Going up to hover height: " << hover_height << " from current height: " << state.pos[1] << "\n";
-        std::cerr << "Required acceleration: " << required_accel[1] << "\n";
-        std::cerr << "Time for acceleration: " << t1 << "\n";
-        std::cerr << "Time for coasting: " << t2 << "\n";
-
-        action_handler.add_action({Action::THRUST, required_accel[1], t1, .is_parallel=0});
-        action_handler.add_action({Action::IDLE, 0.0, t2, .is_parallel=0});
+        if (up_first) {
+            action_handler.add_action({Action::THRUST, A, t1, .is_parallel=0});
+            action_handler.add_action({Action::IDLE, 0.0, t2, .is_parallel=0});
+        } else {
+            action_handler.add_action({Action::IDLE, 0.0, t1, .is_parallel=0});
+            action_handler.add_action({Action::THRUST, A, t2, .is_parallel=0});
+        }
     }
 
     void tick(){
+        if (action_handler.act_bck.empty()) {
+            next_phase();
+        }
         action_handler.run_actions(state);
         state.time += T_STEP;
     }
