@@ -514,7 +514,10 @@ public:
                 switch (act.type){
                     case Action::THRUST:
                         std::cerr << "Stopping thrust\n";
-                        robust_thruster(act, state);
+                        Main_Thruster(0.0);
+                        Left_Thruster(0.0);
+                        Right_Thruster(0.0);
+                        // robust_thruster(act, state);
 
                         std::cerr << "\n\n\n===================================\n";
                         std::cerr << "After Thrusting\n";
@@ -593,8 +596,8 @@ public:
             // Update the game state variables with only gravity
             state.vel[0] += state.accel[0] * T_STEP;
             state.vel[1] += state.accel[1] * T_STEP;
-            state.pos[0] += state.vel[0] * T_STEP;
-            state.pos[1] -= state.vel[1] * T_STEP;  // Subtract to account for flipped coordinates
+            state.pos[0] += state.vel[0] * T_STEP * S_SCALE;
+            state.pos[1] -= state.vel[1] * T_STEP * S_SCALE;  // Subtract to account for flipped coordinates
         }
 
         void run_actions(game_state &state){
@@ -625,7 +628,7 @@ public:
                 }
             }
 
-            // process_state_updates(state);
+            process_state_updates(state);
 
             if (detected_all_completed) {
                 is_running = 0;
@@ -767,8 +770,8 @@ public:
         future_state.accel[0] = 0;
         future_state.accel[1] = -G_ACCEL;
         future_state.angle = 0;
-        future_state.pos[0] += s_rot1[0] + s[0] + s_rot2[0] + s_hover[0];
-        future_state.pos[1] -= s_rot1[1] + s[1] + s_rot2[1] + s_hover[1];
+        future_state.pos[0] += (s_rot1[0] + s[0] + s_rot2[0] + s_hover[0]) * S_SCALE;
+        future_state.pos[1] -= (s_rot1[1] + s[1] + s_rot2[1] + s_hover[1]) * S_SCALE;
         future_state.time += required_angle_time + target_time + required_angle_time_2 + hover_time;
 
         std::cerr << "\n\n\n===================================\n";
@@ -813,7 +816,7 @@ public:
         const double G = G_ACCEL;
 
         double u = state.vel[1]; // u_y (up-positive)
-        double h = state.pos[1] - hover_height; // Height to move (up-positive)
+        double h = (state.pos[1] - hover_height) / S_SCALE; // Height to move (up-positive)
 
         double v; // velocity after acceleration phase
         double t1 = 0.0;  // duration of acceleration phase
