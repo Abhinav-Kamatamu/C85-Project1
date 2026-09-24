@@ -165,7 +165,7 @@
 #include <string.h>
 #include "Lander_Control.h"
 
-#define UP_ACCEL 10
+#define UP_ACCEL 25
 
 #define FLOATING_TOLERANCE 0.00001f
 #define HOVER_HEIGHT 70
@@ -276,7 +276,7 @@ void robust_thruster(double accel_x, double accel_y, struct game_state &state) {
 double Angle_Robust() {
     double sum = 0;
     for (int i = 0; i < NSAMPLES; i++)
-        sum += Angle();
+        sum += normalize_angle(Angle());
     return sum / NSAMPLES;
 }
 
@@ -583,7 +583,7 @@ public:
                 }
             }
 
-            process_state_updates(state);
+            // process_state_updates(state);
 
             if (detected_all_completed) {
                 is_running = 0;
@@ -619,7 +619,7 @@ public:
         switch(phase){
             case STABILISE:
                 phase = GO_UP;
-                go_up(state);
+                // go_up(state);
                 break;
             case GO_UP:
                 phase = GO_HORIZONTAL;
@@ -677,12 +677,17 @@ public:
             
             min_rot_angle = find_min_travel_angle(destination_angle, state.angle);
             
-            required_angle_time = (fabs(min_rot_angle) / (MAX_ROT_RATE * 180.0 / PI)) * T_STEP; ;
+            // robust_rotate rotates by angle / ROTATE_DELIVERY_RATIO, so it takes longer...
+            required_angle_time = (fabs(min_rot_angle) / ROTATE_DELIVERY_RATIO / (MAX_ROT_RATE * 180.0 / PI)) * T_STEP;
             time_offset = required_angle_time;
         }
         
         thrust_mag = sqrt(required_accel[0] * required_accel[0] +
                                 required_accel[1] * required_accel[1]);
+
+        // time for the second rotation
+        double required_angle_time_2 = (fabs(destination_angle) / ROTATE_DELIVERY_RATIO / (MAX_ROT_RATE * 180.0 / PI)) * T_STEP;
+        double hover_time = 1.0;
 
         std::cerr << "Thrust magnitude: " << thrust_mag << ";\n Change Angle: " << min_rot_angle << "\n";
                                 //    type  ---------- value ----------- duration ------- is_parallel
@@ -690,19 +695,38 @@ public:
         action_handler.add_action({Action::THRUST, thrust_mag, target_time, .is_parallel=0});
 
         std::cerr << "rotating: " << -destination_angle << "\n";
-        action_handler.add_action({Action::ROTATE, -destination_angle, required_angle_time, .is_parallel=0});
-        action_handler.add_action({Action::THRUST, G_ACCEL, 1, .is_parallel=0});
+        action_handler.add_action({Action::ROTATE, -destination_angle, required_angle_time_2, .is_parallel=0});
+        action_handler.add_action({Action::THRUST, G_ACCEL, hover_time, .is_parallel=0});
+
+        // displacement during the first rotation
+        double u_rot1_end[2];
+        double s_rot1[2];
+        solve_equation_2d(u, u_rot1_end, G_accel, &required_angle_time, s_rot1, 's');
+
+        // second rotation, starting from rest, free fall
+        double v_rot2_end[2];
+        double s_rot2[2];
+        solve_equation_2d(v, v_rot2_end, G_accel, &required_angle_time_2, s_rot2, 'v');
+        solve_equation_2d(v, v_rot2_end, G_accel, &required_angle_time_2, s_rot2, 's');
+
+        // velocity from rotation 2 is carried through
+        double zero_accel[2] = {0.0, 0.0};
+        double v_hover_end[2];
+        double s_hover[2];
+        solve_equation_2d(v_rot2_end, v_hover_end, zero_accel, &hover_time, s_hover, 'v');
+        solve_equation_2d(v_rot2_end, v_hover_end, zero_accel, &hover_time, s_hover, 's');
 
         game_state future_state = state;
-        future_state.vel[0] = 0;
-        future_state.vel[1] = 0;
+        future_state.vel[0] = v_hover_end[0];
+        future_state.vel[1] = v_hover_end[1];
         future_state.accel[0] = 0;
         future_state.accel[1] = -G_ACCEL;
         future_state.angle = 0;
-        future_state.pos[0] += s[0];
-        future_state.pos[1] -= s[1];
+        future_state.pos[0] += s_rot1[0] + s[0] + s_rot2[0] + s_hover[0];
+        future_state.pos[1] -= s_rot1[1] + s[1] + s_rot2[1] + s_hover[1];
+        future_state.time += required_angle_time + target_time + required_angle_time_2 + hover_time;
 
-        
+        go_up(future_state);
     }
 
     void go_up(game_state state) {
