@@ -159,14 +159,12 @@
   Standard C libraries
 */
 
+#include "Lander_Control.h"
+#include <iostream>
 #include <math.h>
 #include <stdio.h>
-#include <iostream>
-#include <vector>
 #include <string.h>
 #include <vector>
-#include <string.h>
-#include "Lander_Control.h"
 
 #define UP_ACCEL 25
 #define FLOATING_TOLERANCE 0.00001f
@@ -176,15 +174,19 @@
 #define MAIN_OFFSET 0.0
 #define LEFT_OFFSET 90.0
 #define RIGHT_OFFSET -90.0
-#define DELIVERY_RATIO 0.95   // Rotate(), Main/Left/Right_Thruster() all deliver 95% of whatever is asked
-                                // (mean 0.94999, median 0.95000 over 292 samples of all controls; linear, no offset)
-#define ROTATE_TOLERANCE 3.0   // degrees - skip re-rotating for corrections this small
-                                 // (without this, any nonzero residual misalignment
-                                 // re-triggers a full rotate cycle and thrust never sustains)
+#define DELIVERY_RATIO 0.95  // Rotate(), Main/Left/Right_Thruster() all deliver 95% of whatever is asked \
+                             // (mean 0.94999, median 0.95000 over 292 samples of all controls; linear, no offset)
+#define ROTATE_TOLERANCE 3.0 // degrees - skip re-rotating for corrections this small \
+                             // (without this, any nonzero residual misalignment      \
+                             // re-triggers a full rotate cycle and thrust never sustains)
+
+/*****************************************************************************
+ ******************* ROBUST SENSOR AND CONTROL FUNCTIONS *********************
+ *****************************************************************************/
 
 enum NormalizeType {
     Nangle,
-    Nother
+    Nthrust
 };
 
 double normalize_value(double value, NormalizeType type) {
@@ -194,8 +196,8 @@ double normalize_value(double value, NormalizeType type) {
             value -= 360.0;
         else if (value <= -180.0)
             value += 360.0;
-    } else if (type == Nother) {
-       value = fmin(fmax(value / DELIVERY_RATIO, 0.0), 1.0);
+    } else if (type == Nthrust) {
+        value = fmin(fmax(value / DELIVERY_RATIO, 0.0), 1.0);
     }
     return value;
 }
@@ -216,157 +218,151 @@ void Robust(void (*Control)(double), double normalized_value) {
     Control(normalized_value);
 }
 
-int a = 1;
 
+double find_min_travel_angle(double required_angle, double state_angle) {
+    /* This function calculates the angle to make inside our call to 
+     * rotate from one angle to another. */
 
+    double diff = required_angle - state_angle;
 
-// We assume single-threaded operation.
-static double rotate_start_time = 0.0;
-static double rotate_duration = 0.0;
+    diff = fmod(diff, 360.0);
 
-void robust_rotate(double delta) {
-    if (!isfinite(delta)) return;
-    delta = normalize_value(delta, Nangle);
-    // calculated estimate of where we'll end up, the theoretical delta
-    double compensated = delta / DELIVERY_RATIO;
-    // overshoot, since we know it delivers ~95% of it
-    double compensated_rad = fabs(compensated) * PI / 180.0;
-    rotate_duration   = (compensated_rad / MAX_ROT_RATE) * T_STEP;
-    Robust(Rotate, compensated);
+    if (diff <= -180.0) {
+        diff += 360.0;
+    } else if (diff > 180.0) {
+        diff -= 360.0;
+    }
+    return diff;
 }
 
-// Returns 1 once enough simulated time has passed for the most recent
-// robust_rotate call to physically finish, 0 while still waiting.
-// Just timing, no sensor involved
+class TaskControl {
+    double m_accel; // main thruster power
+    double l_accel; // left thruster power
+    double r_accel; // right thruster power
 
+    double current_angle;             // We want to be tracking the current angle of the lander.
+    double thruster_angle_offset = 0; // To be changed based on which thruster is broken.
 
+    bool is_safe_to_rotate = true; // If it is not safe to rotate, then don't allow others to call rotate.
 
-double find_min_travel_angle(double required_angle, double state_angle){
-        double diff = required_angle - state_angle;
-        diff = fmod(diff, 360.0);
-        if(diff <= -180.0){
-            diff += 360.0;
-        } else if (diff > 180.0){
-            diff -= 360.0;
-        }
-        return diff;
-}
-
-class ThrusterControl{
-  double mp;
-  double lp;
-  double rp;
-
-  double current_angle;
-
-  bool is_safe_to_rotate = true;
-
-  enum WhichThurster{
-      MAIN_THRUSTER,
-      LEFT_THRUSTER,
-      RIGHT_THRUSTER
-  } use_thruster = MAIN_THRUSTER;
+    enum WhichThurster {
+        MAIN_THRUSTER,
+        LEFT_THRUSTER,
+        RIGHT_THRUSTER
+    } use_thruster = MAIN_THRUSTER; // Enum keeps track of which thruster is currently being used.
 
   public:
-  ThrusterControl(){
-      mp = 0.0;
-      lp = 0.0;
-      rp = 0.0;
-      current_angle = Robust(Angle);
-  }
-
-  void robust_thruster(double main_power, double left_power, double right_power){
-  
-      if (main_power == -1){
-        main_power = mp;
-      }
-      if (left_power == -1){
-        left_power = lp;
-      }
-      if (right_power == -1){
-        right_power = rp;
-      }
-    
-      mp = normalize_value(main_power, Nother) * MT_ACCEL;
-      lp = normalize_value(left_power, Nother) * LT_ACCEL;
-      rp = normalize_value(right_power, Nother) * RT_ACCEL;
-
-      is_safe_to_rotate = false;
-
-      current_angle = Robust(Angle);
-
-      double want_to_go_angle = atan2(lp - rp, mp) * 180.0 / PI;
-
-      robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
-      current_angle = want_to_go_angle;
-
-      double power = sqrt(mp * mp + (lp -rp) * (lp - rp));
-      
-      fire_thruster(power);
-  }
-
-  void change_broken_thruster(){
-    if (!MT_OK)
-      {
-        use_thruster = LEFT_THRUSTER;
-        double want_to_go_angle = LEFT_OFFSET + current_angle;
-        robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
-        current_angle = want_to_go_angle;
-      }
-    else if (!LT_OK)
-      {
-        use_thruster = RIGHT_THRUSTER;
-        double want_to_go_angle = RIGHT_OFFSET + current_angle;
-        robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
-        current_angle = want_to_go_angle;
-      }
-    else if (!RT_OK)
-      {
-        use_thruster = MAIN_THRUSTER;
-        double want_to_go_angle = MAIN_OFFSET + current_angle;
-        robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
-        current_angle = want_to_go_angle;
-      }
-  }
-
-  void correct_angle(){
-    double angle_right_now = Robust(Angle);
-    robust_rotate(find_min_travel_angle(current_angle, angle_right_now));
-  }
-
-  void tick(){
-    robust_thruster(-1, -1, -1);
-    change_broken_thruster();
-    correct_angle();
-  }
-
-  void fire_thruster(double power){
-    switch (use_thruster){
-        case MAIN_THRUSTER:
-            mp = normalize_value(power, Nother);
-            Main_Thruster(mp);
-            break;
-        case LEFT_THRUSTER:
-            lp = normalize_value(power, Nother);
-            Left_Thruster(lp);
-            break;
-        case RIGHT_THRUSTER:
-            rp = normalize_value(power, Nother);
-            Right_Thruster(rp);
-            break;
+    TaskControl() {
+        m_accel = 0.0;
+        l_accel = 0.0;
+        r_accel = 0.0;
+        current_angle = Robust(Angle);
     }
-  }
+
+    void robust_thruster(double main_power, double left_power, double right_power) {
+        if (main_power != -1) {
+            m_accel = main_power * MT_ACCEL;
+        }
+        if (left_power != -1) {
+            l_accel = left_power * LT_ACCEL;
+        }
+        if (right_power != -1) {
+            r_accel = right_power * RT_ACCEL;
+        }
+
+        is_safe_to_rotate = false;
+
+        current_angle = Robust(Angle);
+
+        double want_to_go_angle = atan2(l_accel - r_accel, m_accel) * 180.0 / PI;
+        
+
+        robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
+        
+        current_angle = want_to_go_angle;
+
+        double net_accel = sqrt(m_accel * m_accel + (l_accel - r_accel) * (l_accel - r_accel));
+
+        fire_thruster(net_accel);
+        std::cerr << "Firing thruster with power: " << net_accel << "\r";
+    }
+
+    void robust_rotate(double delta) {
+        if (!isfinite(delta))
+            return;
+
+        delta = normalize_value(delta, Nangle); // First normalise the angle we want to shift
+
+        // calculated estimate of where we'll end up, the theoretical delta
+        double compensated = delta / DELIVERY_RATIO;
+
+        // overshoot, since we know it delivers ~95% of it
+
+        double compensated_rad = fabs(compensated) * PI / 180.0;
+        Robust(Rotate, compensated);
+    }
+
+    void change_broken_thruster() {
+        if (!MT_OK) {
+            use_thruster = LEFT_THRUSTER;
+            double want_to_go_angle = LEFT_OFFSET + current_angle;
+            robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
+            current_angle = want_to_go_angle;
+        } else if (!LT_OK) {
+            use_thruster = RIGHT_THRUSTER;
+            double want_to_go_angle = RIGHT_OFFSET + current_angle;
+            robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
+            current_angle = want_to_go_angle;
+        } else if (!RT_OK) {
+            use_thruster = MAIN_THRUSTER;
+            double want_to_go_angle = MAIN_OFFSET + current_angle;
+            robust_rotate(find_min_travel_angle(want_to_go_angle, current_angle));
+            current_angle = want_to_go_angle;
+        }
+    }
+
+    void correct_angle() {
+        double angle_right_now = Robust(Angle);
+        robust_rotate(find_min_travel_angle(current_angle, angle_right_now));
+    }
+
+    void tick() {
+        robust_thruster(-1, -1, -1);
+        change_broken_thruster();
+        correct_angle();
+    }
+
+    void fire_thruster(double accel) {
+        switch (use_thruster) {
+            case MAIN_THRUSTER:
+                {
+                    double mp = normalize_value(accel, Nthrust);
+                    Main_Thruster(mp);
+                    break;
+                }
+            case LEFT_THRUSTER:
+                {
+                    double lp = normalize_value(accel, Nthrust);
+                    Left_Thruster(lp);
+                    break;
+                }
+            case RIGHT_THRUSTER:
+                {
+                    double rp = normalize_value(accel, Nthrust);
+                    Right_Thruster(rp);
+                    break;
+                }
+        }
+    }
 };
 
-ThrusterControl* get_thruster(){
-  static ThrusterControl s;
-  return &s;
+TaskControl *get_thruster() {
+    static TaskControl s;
+    return &s;
 }
 
-
-
 void Lander_Control(void) {
-  /*
+    /*
     This is the main control function for the lander. It attempts
     to bring the ship to the location of the landing platform
     keeping landing parameters within the acceptable limits.
@@ -388,7 +384,7 @@ void Lander_Control(void) {
     fine.
  */
 
-  /*************************************************
+    /*************************************************
    TO DO: Modify this function so that the ship safely
           reaches the platform even if components and
           sensors fail!
@@ -416,96 +412,96 @@ void Lander_Control(void) {
           I'll give you zero.
   **************************************************/
 
-  double VXlim;
-  double VYlim;
+    double VXlim;
+    double VYlim;
 
-  ThrusterControl* tc = get_thruster();
+    TaskControl *tc = get_thruster();
 
-  // Set velocity limits depending on distance to platform.
-  // If the module is far from the platform allow it to
-  // move faster, decrease speed limits as the module
-  // approaches landing. You may need to be more conservative
-  // with velocity limits when things fail.
-  if (fabs(Robust(Position_X) - PLAT_X) > 200)
-    VXlim = 25;
-  else if (fabs(Robust(Position_X) - PLAT_X) > 100)
-    VXlim = 15;
-  else
-    VXlim = 5;
+    // Set velocity limits depending on distance to platform.
+    // If the module is far from the platform allow it to
+    // move faster, decrease speed limits as the module
+    // approaches landing. You may need to be more conservative
+    // with velocity limits when things fail.
+    if (fabs(Robust(Position_X) - PLAT_X) > 200)
+        VXlim = 25;
+    else if (fabs(Robust(Position_X) - PLAT_X) > 100)
+        VXlim = 15;
+    else
+        VXlim = 5;
 
-  if (PLAT_Y - Robust(Position_Y) > 200)
-    VYlim = -20;
-  else if (PLAT_Y - Robust(Position_Y) > 100)
-    VYlim = -10; // These are negative because they
-  else
-    VYlim = -4; // limit descent velocity
+    if (PLAT_Y - Robust(Position_Y) > 200)
+        VYlim = -20;
+    else if (PLAT_Y - Robust(Position_Y) > 100)
+        VYlim = -10; // These are negative because they
+    else
+        VYlim = -4; // limit descent velocity
 
-  // Ensure we will be OVER the platform when we land
-  if (fabs(PLAT_X - Robust(Position_X)) / fabs(Robust(Velocity_X)) > 1.25 * fabs(PLAT_Y - Robust(Position_Y)) / fabs(Robust(Velocity_Y)))
-    VYlim = 0;
+    // Ensure we will be OVER the platform when we land
+    if (fabs(PLAT_X - Robust(Position_X)) / fabs(Robust(Velocity_X)) > 1.25 * fabs(PLAT_Y - Robust(Position_Y)) / fabs(Robust(Velocity_Y)))
+        VYlim = 0;
 
-  // IMPORTANT NOTE: The code below assumes all components working
-  // properly. IT MAY OR MAY NOT BE USEFUL TO YOU when components
-  // fail. More likely, you will need a set of case-based code
-  // chunks, each of which works under particular failure conditions.
+    // IMPORTANT NOTE: The code below assumes all components working
+    // properly. IT MAY OR MAY NOT BE USEFUL TO YOU when components
+    // fail. More likely, you will need a set of case-based code
+    // chunks, each of which works under particular failure conditions.
 
-  // Check for rotation away from zero degrees - Rotate first,
-  // use thrusters only when not rotating to avoid adding
-  // velocity components along the rotation directions
-  // Note that only the latest Rotate() command has any
-  // effect, i.e. the rotation Robust(Angle) does not accumulate
-  // for successive calls.
+    // Check for rotation away from zero degrees - Rotate first,
+    // use thrusters only when not rotating to avoid adding
+    // velocity components along the rotation directions
+    // Note that only the latest Rotate() command has any
+    // effect, i.e. the rotation Robust(Angle) does not accumulate
+    // for successive calls.
 
-//   if (Robust(Angle) > 1 && Robust(Angle) < 359) {
-//     if (Robust(Angle) >= 180)
-//       robust_rotate(360 - Robust(Angle));
-//     else
-//       robust_rotate(-Robust(Angle));
-//     return;
-//   }
-  // Module is oriented properly, check for horizontal position
-  // and set thrusters appropriately.
-  if (Robust(Position_X) > PLAT_X) {
-    // Lander is to the LEFT of the landing platform, use Right thrusters to move
-    // lander to the left.
-    tc->robust_thruster(-1, 0, -1);
-    //Left_Thruster(0); // Make sure we're not fighting ourselves here!
-    if (Robust(Velocity_X) > (-VXlim))
-      tc->robust_thruster(-1, -1, (VXlim + fmin(0, Robust(Velocity_X))) / VXlim);
-      //Right_Thruster((VXlim + fmin(0, Robust(Velocity_X))) / VXlim);
-    else {
-      // Exceeded velocity limit, brake
-      //Right_Thruster(0);
-      tc->robust_thruster(-1, fabs(VXlim - Robust(Velocity_X)), 0);
-      //Left_Thruster(fabs(VXlim - Robust(Velocity_X)));
+    if (Robust(Angle) > 1 && Robust(Angle) < 359) {
+    if (Robust(Angle) >= 180)
+        tc->robust_rotate(360 - Robust(Angle));
+    else
+        tc->robust_rotate(-Robust(Angle));
+    return;
     }
-  } else {
-    // Lander is to the RIGHT of the landing platform, opposite from above
-   // Right_Thruster(0);
-    tc->robust_thruster(-1, -1, 0);
-    if (Robust(Velocity_X) < VXlim)
-      tc->robust_thruster(-1, (VXlim - fmax(0, Robust(Velocity_X))) / VXlim, -1);
-      //Left_Thruster((VXlim - fmax(0, Robust(Velocity_X))) / VXlim);
-    else {
-      tc->robust_thruster(-1, 0, fabs(VXlim - Robust(Velocity_X)));
-      //Left_Thruster(0);
-      //Right_Thruster(fabs(VXlim - Robust(Velocity_X)));
+    // Module is oriented properly, check for horizontal position
+    // and set thrusters appropriately.
+    if (Robust(Position_X) > PLAT_X) {
+        // Lander is to the LEFT of the landing platform, use Right thrusters to move
+        // lander to the left.
+        tc->robust_thruster(-1, 0, -1);
+        //Left_Thruster(0); // Make sure we're not fighting ourselves here!
+        if (Robust(Velocity_X) > (-VXlim))
+            tc->robust_thruster(-1, -1, (VXlim + fmin(0, Robust(Velocity_X))) / VXlim);
+        //Right_Thruster((VXlim + fmin(0, Robust(Velocity_X))) / VXlim);
+        else {
+            // Exceeded velocity limit, brake
+            //Right_Thruster(0);
+            tc->robust_thruster(-1, fabs(VXlim - Robust(Velocity_X)), 0);
+            //Left_Thruster(fabs(VXlim - Robust(Velocity_X)));
+        }
+    } else {
+        // Lander is to the RIGHT of the landing platform, opposite from above
+        // Right_Thruster(0);
+        tc->robust_thruster(-1, -1, 0);
+        if (Robust(Velocity_X) < VXlim)
+            tc->robust_thruster(-1, (VXlim - fmax(0, Robust(Velocity_X))) / VXlim, -1);
+        //Left_Thruster((VXlim - fmax(0, Robust(Velocity_X))) / VXlim);
+        else {
+            tc->robust_thruster(-1, 0, fabs(VXlim - Robust(Velocity_X)));
+            //Left_Thruster(0);
+            //Right_Thruster(fabs(VXlim - Robust(Velocity_X)));
+        }
     }
-  }
 
-  // Vertical adjustments. Basically, keep the module below the limit for
-  // vertical velocity and allow for continuous descent. We trust
-  // Safety_Override() to save us from crashing with the ground.
-  if (Robust(Velocity_Y) < VYlim)
-    tc->robust_thruster(1, -1, -1);
+    // Vertical adjustments. Basically, keep the module below the limit for
+    // vertical velocity and allow for continuous descent. We trust
+    // Safety_Override() to save us from crashing with the ground.
+    if (Robust(Velocity_Y) < VYlim)
+        tc->robust_thruster(1, -1, -1);
     //Main_Thruster(1.0);
-  else
-    //Main_Thruster(0);
-    tc->robust_thruster(0, -1, -1);
+    else
+        //Main_Thruster(0);
+        tc->robust_thruster(0, -1, -1);
 }
 
 void Safety_Override(void) {
-  /*
+    /*
     This function is intended to keep the lander from
     crashing. It checks the sonar distance array,
     if the distance to nearby solid surfaces and
@@ -518,13 +514,13 @@ void Safety_Override(void) {
     operation.
   */
 
-  /**************************************************
+    /**************************************************
    TO DO: Modify this function so that it can do its
           work even if components or sensors
           fail
   **************************************************/
 
-  /**************************************************
+    /**************************************************
     How this works:
     Check the sonar readings, for each sonar
     reading that is below a minimum safety threshold
@@ -533,98 +529,97 @@ void Safety_Override(void) {
     carry out speed corrections using the thrusters
   **************************************************/
 
-  double DistLimit;
-  double Vmag;
-  double dmin;
+    double DistLimit;
+    double Vmag;
+    double dmin;
 
-  ThrusterControl* tc = get_thruster();
+    TaskControl *tc = get_thruster();
 
-  // Establish distance threshold based on lander
-  // speed (we need more time to rectify direction
-  // at high speed)
-  Vmag = Robust(Velocity_X) * Robust(Velocity_X);
-  Vmag += Robust(Velocity_Y) * Robust(Velocity_Y);
+    // Establish distance threshold based on lander
+    // speed (we need more time to rectify direction
+    // at high speed)
+    Vmag = Robust(Velocity_X) * Robust(Velocity_X);
+    Vmag += Robust(Velocity_Y) * Robust(Velocity_Y);
 
-  DistLimit = fmax(75, Vmag);
+    DistLimit = fmax(75, Vmag);
 
-  // If we're close to the landing platform, disable
-  // safety override (close to the landing platform
-  // the Control_Policy() should be trusted to
-  // safely land the craft)
-  if (fabs(PLAT_X - Robust(Position_X)) < 150 && fabs(PLAT_Y - Robust(Position_Y)) < 150)
-    return;
+    // If we're close to the landing platform, disable
+    // safety override (close to the landing platform
+    // the Control_Policy() should be trusted to
+    // safely land the craft)
+    if (fabs(PLAT_X - Robust(Position_X)) < 150 && fabs(PLAT_Y - Robust(Position_Y)) < 150)
+        return;
 
-  // Determine the closest surfaces in the direction
-  // of motion. This is done by checking the sonar
-  // array in the quadrant corresponding to the
-  // ship's motion direction to find the entry
-  // with the smallest registered distance
+    // Determine the closest surfaces in the direction
+    // of motion. This is done by checking the sonar
+    // array in the quadrant corresponding to the
+    // ship's motion direction to find the entry
+    // with the smallest registered distance
 
-  // Horizontal direction.
-  dmin = 1000000;
-  if (Robust(Velocity_X) > 0) {
-    for (int i = 5; i < 14; i++)
-      if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
-        dmin = SONAR_DIST[i];
-  } else {
-    for (int i = 22; i < 32; i++)
-      if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
-        dmin = SONAR_DIST[i];
-  }
-  // Determine whether we're too close for comfort. There is a reason
-  // to have this distance limit modulated by horizontal speed...
-  // what is it?
-  if (dmin < DistLimit * fmax(.25, fmin(fabs(Robust(Velocity_X)) / 5.0, 1))) { // Too close to a surface in the horizontal direction
-    // if (Robust(Angle) > 1 && Robust(Angle) < 359) {
-    //   if (Robust(Angle) >= 180)
-    //     robust_rotate(360 - Robust(Angle));
-    //   else
-    //     robust_rotate(-Robust(Angle));
-    //   return;
-    // }
-
+    // Horizontal direction.
+    dmin = 1000000;
     if (Robust(Velocity_X) > 0) {
-      tc->robust_thruster(-1, 0, 1);
-      //Right_Thruster(1.0);
-      //Left_Thruster(0.0);
+        for (int i = 5; i < 14; i++)
+            if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
+                dmin = SONAR_DIST[i];
     } else {
-      tc->robust_thruster(-1, 1, 0);
-      //Left_Thruster(1.0);
-      //Right_Thruster(0.0);
+        for (int i = 22; i < 32; i++)
+            if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
+                dmin = SONAR_DIST[i];
     }
-  }
+    // Determine whether we're too close for comfort. There is a reason
+    // to have this distance limit modulated by horizontal speed...
+    // what is it?
+    if (dmin < DistLimit * fmax(.25, fmin(fabs(Robust(Velocity_X)) / 5.0, 1))) { // Too close to a surface in the horizontal direction
+        if (Robust(Angle) > 1 && Robust(Angle) < 359) {
+          if (Robust(Angle) >= 180)
+            tc->robust_rotate(360 - Robust(Angle));
+          else
+            tc->robust_rotate(-Robust(Angle));
+          return;
+        }
 
-  // Vertical direction
-  dmin = 1000000;
-  if (Robust(Velocity_Y) > 5) // Mind this! there is a reason for it...
-  {
-    for (int i = 0; i < 5; i++)
-      if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
-        dmin = SONAR_DIST[i];
-    for (int i = 32; i < 36; i++)
-      if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
-        dmin = SONAR_DIST[i];
-  } else {
-    for (int i = 14; i < 22; i++)
-      if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
-        dmin = SONAR_DIST[i];
-  }
-  if (dmin < DistLimit) // Too close to a surface in the horizontal direction
-  {
-    if (Robust(Angle) > 1 || Robust(Angle) > 359) {
-    //   if (Robust(Angle) >= 180)
-    //     robust_rotate(360 - Robust(Angle));
-    //   else
-    //     robust_rotate(-Robust(Angle));
-    //   return;
+        if (Robust(Velocity_X) > 0) {
+            tc->robust_thruster(-1, 0, 1);
+            //Right_Thruster(1.0);
+            //Left_Thruster(0.0);
+        } else {
+            tc->robust_thruster(-1, 1, 0);
+            //Left_Thruster(1.0);
+            //Right_Thruster(0.0);
+        }
     }
-    if (Robust(Velocity_Y) > 2.0) 
+
+    // Vertical direction
+    dmin = 1000000;
+    if (Robust(Velocity_Y) > 5) // Mind this! there is a reason for it...
     {
-      //Main_Thruster(0.0);
-      tc->robust_thruster(0, -1, -1);
+        for (int i = 0; i < 5; i++)
+            if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
+                dmin = SONAR_DIST[i];
+        for (int i = 32; i < 36; i++)
+            if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
+                dmin = SONAR_DIST[i];
     } else {
-      //Main_Thruster(1.0);
-      tc->robust_thruster(1, -1, -1);
+        for (int i = 14; i < 22; i++)
+            if (SONAR_DIST[i] > -1 && SONAR_DIST[i] < dmin)
+                dmin = SONAR_DIST[i];
     }
-  }
+    if (dmin < DistLimit) // Too close to a surface in the horizontal direction
+    {
+        if (Robust(Angle) > 1 || Robust(Angle) > 359) {
+              if (Robust(Angle) >= 180)
+                tc->robust_rotate(360 - Robust(Angle));
+              else
+                tc->robust_rotate(-Robust(Angle));
+              return;
+        }
+        if (Robust(Velocity_Y) > 2.0) {
+            //Main_Thruster(0.0);
+            tc->robust_thruster(0, -1, -1);
+        } else {
+            //Main_Thruster(1.0);
+            tc->robust_thruster(1, -1, -1);
+        }
+    }
 }

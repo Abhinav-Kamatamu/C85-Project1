@@ -184,7 +184,7 @@
 
 enum NormalizeType {
     Nangle,
-    Nother
+    Nthrust
 };
 
 double normalize_value(double value, NormalizeType type) {
@@ -194,7 +194,7 @@ double normalize_value(double value, NormalizeType type) {
             value -= 360.0;
         else if (value <= -180.0)
             value += 360.0;
-    } else if (type == Nother) {
+    } else if (type == Nthrust) {
        value = fmin(fmax(value / DELIVERY_RATIO, 0.0), 1.0);
     }
     return value;
@@ -287,9 +287,9 @@ class ThrusterControl{
         rp = right_power;
       }
     
-      mp = normalize_value(main_power, Nother);
-      lp = normalize_value(left_power, Nother);
-      rp = normalize_value(right_power, Nother);
+      mp = normalize_value(main_power, Nthrust);
+      lp = normalize_value(left_power, Nthrust);
+      rp = normalize_value(right_power, Nthrust);
 
       is_safe_to_rotate = false;
 
@@ -343,15 +343,15 @@ class ThrusterControl{
   void fire_thruster(double power){
     switch (use_thruster){
         case MAIN_THRUSTER:
-            mp = normalize_value(power, Nother);
+            mp = normalize_value(power, Nthrust);
             Main_Thruster(mp);
             break;
         case LEFT_THRUSTER:
-            lp = normalize_value(power, Nother);
+            lp = normalize_value(power, Nthrust);
             Left_Thruster(lp);
             break;
         case RIGHT_THRUSTER:
-            rp = normalize_value(power, Nother);
+            rp = normalize_value(power, Nthrust);
             Right_Thruster(rp);
             break;
     }
