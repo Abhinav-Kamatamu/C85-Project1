@@ -180,6 +180,8 @@
 #define ROTATE_TOLERANCE 3.0 // degrees - skip re-rotating for corrections this small \
                              // (without this, any nonzero residual misalignment      \
                              // re-triggers a full rotate cycle and thrust never sustains)
+#define ALIGN_ALTITUDE 25.0
+#define PLAT_TOL 10.0  
 
 /*****************************************************************************
  ******************* ROBUST SENSOR AND CONTROL FUNCTIONS *********************
@@ -411,9 +413,15 @@ void Lander_Control(void) {
 
     // Ensure we will be OVER the platform when we land
 
-    if (fabs(PLAT_X - Robust(Position_X)) / fabs(Robust(Velocity_X)) > 1.25 * fabs(PLAT_Y - Robust(Position_Y)) / fabs(Robust(Velocity_Y))) {
-        VYlim = 0;
-        tc->robust_thruster(-1,0,0);
+    if (PLAT_Y - Robust(Position_Y) < ALIGN_ALTITUDE) {
+        tc->robust_rotate(find_min_travel_angle(0.0, Robust(Angle)));
+
+        double power = (Robust(Velocity_Y) < -1.0 && (fabs(Robust(Position_X) - PLAT_X) < PLAT_TOL )) ? 1.0 : 0.0;
+        if (MT_OK)      Robust(Main_Thruster,  normalize_value(power, Nthrust));
+        else if (LT_OK) Robust(Left_Thruster,  normalize_value(power, Nthrust));
+        else            Robust(Right_Thruster, normalize_value(power, Nthrust));
+
+        return; // skip everything else, no more floating
     }
 
     // IMPORTANT NOTE: The code below assumes all components working
