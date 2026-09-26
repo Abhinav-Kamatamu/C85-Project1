@@ -410,10 +410,11 @@ void Lander_Control(void) {
         VYlim = -4; // limit descent velocity
 
     // Ensure we will be OVER the platform when we land
-    if (fabs(PLAT_X - Robust(Position_X)) / fabs(Robust(Velocity_X)) > 1.25 * fabs(PLAT_Y - Robust(Position_Y)) / fabs(Robust(Velocity_Y)))
+
+    if (fabs(PLAT_X - Robust(Position_X)) / fabs(Robust(Velocity_X)) > 1.25 * fabs(PLAT_Y - Robust(Position_Y)) / fabs(Robust(Velocity_Y))) {
         VYlim = 0;
-        tc->robust_thruster(0,0,0);
-        tc->robust_rotate(-Robust(Angle));
+        tc->robust_thruster(-1,0,0);
+    }
 
     // IMPORTANT NOTE: The code below assumes all components working
     // properly. IT MAY OR MAY NOT BE USEFUL TO YOU when components
