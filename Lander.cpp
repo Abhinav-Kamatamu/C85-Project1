@@ -205,15 +205,25 @@ double normalize_value(double value, NormalizeType type) {
     return value;
 }
 
+// Use circular mean for angles, linear mean for everything else 
 double Robust(double (*Sensor)(void)) {
     double sum = 0;
-    for (int i = 0; i < NSAMPLES; i++) {
-        if (Sensor == Angle)
-            sum += normalize_value(Sensor(), Nangle);
-        else
+    for (int i = 0; i < NSAMPLES; i++) { 
+        if (Sensor == Angle) {
+            double sin_num = 0;
+            double cos_num = 0;
+            for (int i = 0; i < NSAMPLES; i++) {
+                double rad = Sensor() * PI / 180.0;
+                sin_num += sin(rad);
+                cos_num += cos(rad);
+            }
+            return atan2(sin_num, cos_num) * 180.0 / PI;
+        }   
+        for (int i = 0; i < NSAMPLES; i++) {
             sum += Sensor();
-    }
+        }
     return sum / NSAMPLES;
+    }
 }
 
 /* Make sure value is normalized */
