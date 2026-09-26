@@ -417,9 +417,12 @@ void Lander_Control(void) {
         tc->robust_rotate(find_min_travel_angle(0.0, Robust(Angle)));
 
         double power = (Robust(Velocity_Y) < -1.0 && (fabs(Robust(Position_X) - PLAT_X) < PLAT_TOL )) ? 1.0 : 0.0;
-        if (MT_OK)      Robust(Main_Thruster,  normalize_value(power, Nthrust));
-        else if (LT_OK) Robust(Left_Thruster,  normalize_value(power, Nthrust));
-        else            Robust(Right_Thruster, normalize_value(power, Nthrust));
+        if (MT_OK)
+            Robust(Main_Thruster,  normalize_value(power, Nthrust));
+        else if (LT_OK)
+            Robust(Left_Thruster,  normalize_value(power, Nthrust));
+        else
+            Robust(Right_Thruster, normalize_value(power, Nthrust));
 
         return; // skip everything else, no more floating
     }
