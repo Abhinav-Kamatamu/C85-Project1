@@ -203,14 +203,17 @@
 // 60 is enough. 60 fps)
 #define SONAR_CHECK_RANGE 300.0
 #define SONAR_BROKEN_FRAMES 60
-// a confirmation just has to have happened recently, not literally every
-// frame - RangeDist glancing away for one frame shouldnt kill the streak
-#define SONAR_CONFIRM_GRACE_FRAMES 30
-// how often we spin RangeDist during the "is sonar actually dead" check
-#define CONFIRM_GLANCE_INTERVAL_FRAMES 30
-// weight for "look forward" vs "look at the ground", 0.5 = even split
-#define FORWARD_GROUND_BLEND 0.5
-// below this height AND close horizontally, stop scanning ahead
+// How often (in frames) rangedist_lookahead() re-points RangeDist() at the
+// current direction of travel - reusing the same "60 fps" assumption
+// SONAR_BROKEN_FRAMES already makes, so this is a couple of seconds.
+#define LOOKAHEAD_INTERVAL_FRAMES 120
+// Below this altitude above the platform, AND close to it horizontally,
+// don't bother looking ahead at all - not enough runway left to spend time
+// free-falling through a rotation and still have a normal landing
+// approach. Both axes are required, not just height: on a map with hills
+// near platform height, being at a similar altitude while still far away
+// horizontally isn't a final approach, and a height-only version of this
+// check has already caused exactly that false trigger once before.
 #define LOOKAHEAD_MIN_ALTITUDE 250.0
 // fminmax. This is too small to be a function. Macro way better
 #define FMM(x, y) fmax(-(x), fmin((x), (y)))
@@ -582,18 +585,17 @@ class RobustAgent {
     } memoized[6];
     double sonar_dist[36];
     int sonar_silent_frames = 0;
-    // frames since RangeDist last confirmed something close, see
-    // detect_sonar_failure() below
-    int frames_since_confirmed_close = 1000000;
     int current_thruster = -1;
 
-    // state for sonar_confirm_glance() - spins RangeDist while we're
-    // still figuring out if sonar's actually broken
-    int confirm_glance_timer = 0;
-    bool confirm_glance_active = false;
-    double confirm_glance_target = 0.0;
-
-    // one-way switch, stays true forever once we're near the platform's x
+    // rangedist_lookahead()'s state - periodically points RangeDist() at
+    // wherever we're currently traveling and feeds that one reading into
+    // sonar_dist[], instead of trying to map the whole compass.
+    int lookahead_timer = 0;
+    bool lookahead_active = false;
+    // Latches permanently true the first time position_x() ever comes
+    // within ABOVE_PLATFORM_TOLERANCE of PLAT_X - once true, stays true for
+    // the rest of the flight, even if horizontal position later drifts back
+    // out of that tolerance.
     bool crossed_platform_x = false;
 
     PhysicsEngine physics;
@@ -749,138 +751,99 @@ class RobustAgent {
             set_power(options[best], 0.0);
     }
 
-    // mixes two world angles by averaging their x/y, not the raw numbers
-    // (that breaks near 0/360). weight_a = how much dir_a counts
-    double blend_headings(double dir_a_deg, double dir_b_deg, double weight_a) {
-        double ax = sin(dir_a_deg * PI / 180.0), ay = cos(dir_a_deg * PI / 180.0);
-        double bx = sin(dir_b_deg * PI / 180.0), by = cos(dir_b_deg * PI / 180.0);
-        double x = weight_a * ax + (1.0 - weight_a) * bx;
-        double y = weight_a * ay + (1.0 - weight_a) * by;
-        double blended = atan2(x, y) * 180.0 / PI;
-        if (blended < 0.0) blended += 360.0;
-        return blended;
-    }
-
-    // world direction we're currently moving in, from velocity alone
-    double travel_heading() {
-        double heading = atan2(velocity_x(), velocity_y()) * 180.0 / PI;
-        if (heading < 0.0) {
-            heading += 360.0;
-        }
-        return heading;
-    }
-
-    // body angle that looks forward AND at the ground at once, based
-    // purely on velocity so it works no matter our orientation
-    double forward_and_ground_target() {
-        double blended_heading = blend_headings(travel_heading(), 180.0, FORWARD_GROUND_BLEND);
-
-        // RangeDist points out the belly (body angle + 180), so aiming
-        // at a world direction means subtracting 180 for the body angle
-        double body_target = blended_heading - 180.0;
-        if (body_target < 0.0) {
-            body_target += 360.0;
-        }
-        return body_target;
-    }
-
-    // backup plan for when sonar dies - points RangeDist at wherever
-    // we're heading (mixed a bit toward the ground), recomputed and
-    // read every single frame instead of locking a target once a cycle
+    // Fallback for when the real sonar is broken. Doesn't try to map the
+    // whole compass - just periodically points RangeDist() at wherever
+    // we're CURRENTLY traveling and writes that one reading into
+    // sonar_dist[], so Safety_Override's existing horizontal/vertical
+    // checks (completely unmodified - they already do exactly the right
+    // thing once fed real data: react horizontally, not much vertically,
+    // and only for as long as the live reading says something's actually
+    // close) can see what's ahead in the direction that actually matters.
+    //
+    // Runs every couple of seconds (LOOKAHEAD_INTERVAL_FRAMES), not
+    // continuously - with only one thruster surviving in the failure cases
+    // this matters for, thrust() itself is already fighting for rotation
+    // control every frame (see thrust()'s tilt-and-rotate fallback path),
+    // so this only asks for it in short, infrequent bursts instead of
+    // permanently competing for the body's orientation.
     void rangedist_lookahead() {
-        if (sonar_broken != 1) {
+        if (sonar_broken != 1)
             return;
-        }
 
-        // once we've EVER been near the platform's x, turn off for good -
-        // Lander_Control already knows how to land from here
-        if (!crossed_platform_x && fabs(PLAT_X - position_x()) < ABOVE_PLATFORM_TOLERANCE) {
+        // Once horizontal position has EVER come within tolerance of the
+        // platform's X, disable this permanently for the rest of the
+        // flight - not just while currently aligned. Once we've reached
+        // the platform's column, Lander_Control()'s own proportional
+        // horizontal control (targeting dx=0) and its VYlim descent tiers
+        // are the original, unmodified logic this assignment already
+        // trusted to bring it in - there's no more travel ahead of us left
+        // to scan for, on the one column of terrain the platform itself
+        // guarantees is clear.
+        if (!crossed_platform_x && fabs(PLAT_X - position_x()) < ABOVE_PLATFORM_TOLERANCE)
             crossed_platform_x = true;
-            // wipe sonar_dist too, otherwise a stale old reading keeps
-            // triggering reactions forever after we stop updating it
-            for (int i = 0; i < 36; i++) {
-                sonar_dist[i] = -1;
-            }
-        }
         if (crossed_platform_x) {
+            lookahead_active = false;
             return;
         }
 
-        // close to landing altitude, dont bother - see LOOKAHEAD_MIN_ALTITUDE
+        // Landing altitude - see LOOKAHEAD_MIN_ALTITUDE's comment for why
+        // both axes are checked, not just height.
         if (fabs(PLAT_X - position_x()) < LOOKAHEAD_MIN_ALTITUDE &&
             PLAT_Y - position_y() < LOOKAHEAD_MIN_ALTITUDE) {
+            lookahead_active = false;
             return;
         }
 
-        // recompute the target fresh every frame - no locking, no
-        // waiting for a cycle, so were always chasing where we're
-        // actually headed right now
-        rotate_absolute(forward_and_ground_target());
-
-        // read RangeDist every single frame and log it against whatever
-        // beam were currently facing - DistLimit reacts to it down in
-        // Safety_Override, no separate danger check needed up here
-        double range = RangeDist();
-        double world_dir = physics.angle + 180.0;
-        if (world_dir >= 360.0) {
-            world_dir -= 360.0;
+        lookahead_timer++;
+        // lookahead_timer only starts incrementing once we're already past
+        // every guard above, so it reads exactly 1 on the very first call
+        // that gets this far after sonar breaks - test as soon as possible
+        // instead of waiting a full LOOKAHEAD_INTERVAL_FRAMES first.
+        if (!lookahead_active && (lookahead_timer == 1 || lookahead_timer >= LOOKAHEAD_INTERVAL_FRAMES)) {
+            lookahead_active = true;
+            lookahead_timer = 0;
         }
-        int beam = lround(world_dir / 10.0) % 36;
-        sonar_dist[beam] = range;
-
-        // always free falling while this runs, same deal as before
-        main_thruster(0.0);
-        left_thruster(0.0);
-        right_thruster(0.0);
-    }
-
-    // runs while we're still figuring out if sonar's broken. Steals
-    // rotation so detect_sonar_failure() gets a fair shot at confirming.
-    // turns off automatically once sonar_broken is confirmed
-    void sonar_confirm_glance() {
-        if (sonar_broken == 1) {
+        if (!lookahead_active)
             return;
-        }
 
-        // only bother if sonar's currently showing nothing
-        int all_invalid = 1;
-        for (int i = 0; i < 36; i++) {
-            if (SONAR_DIST[i] > -1) {
-                all_invalid = 0;
-                break;
-            }
-        }
-        if (!all_invalid) {
-            confirm_glance_active = false;
-            confirm_glance_timer = 0;
-            return;
-        }
+        // Recompute the heading fresh every frame (not just once at the
+        // start) so this tracks the actual current direction of travel
+        // even if it changes mid-turn. World-space heading of (vx, vy),
+        // using the same convention as everywhere else in this file (0 =
+        // up, clockwise, sin = horizontal component, cos = vertical):
+        double heading = atan2(velocity_x(), velocity_y()) * 180.0 / PI;
+        if (heading < 0.0) heading += 360.0;
 
-        confirm_glance_timer++;
-        if (!confirm_glance_active &&
-            (confirm_glance_timer == 1 || confirm_glance_timer >= CONFIRM_GLANCE_INTERVAL_FRAMES)) {
-            confirm_glance_active = true;
-            confirm_glance_timer = 0;
-            confirm_glance_target = forward_and_ground_target();
-        }
-        if (!confirm_glance_active) {
-            return;
-        }
+        // RangeDist() points at body_angle + 180 (confirmed against both
+        // the header docs - "direction of the main thruster," i.e. where
+        // it fires, out the bottom - and the sonar_dist[] beam convention
+        // used everywhere else), so aiming it at world-direction `heading`
+        // means the BODY has to target heading - 180, not heading itself.
+        double body_target = heading - 180.0;
+        if (body_target < 0.0) body_target += 360.0;
+        rotate_absolute(body_target);
 
-        rotate_absolute(confirm_glance_target);
-
-        bool aligned = fabs(find_min_travel_angle(confirm_glance_target, physics.angle)) < ROTATE_TOLERANCE;
+        bool aligned = fabs(find_min_travel_angle(body_target, physics.angle)) < ROTATE_TOLERANCE;
         if (!aligned) {
-            // free fall while turning, same deal as rangedist_lookahead()
+            // Free-fall while turning - thrusters are fixed to the body,
+            // so whatever thrust was last commanded for a different
+            // orientation would otherwise push the wrong way as the body
+            // rotates away from it.
             main_thruster(0.0);
             left_thruster(0.0);
             right_thruster(0.0);
             return;
         }
 
-        // dont read RangeDist ourselves. Detect_sonar_failure() already
-        // does that every frame, we just make sure were pointed somewhere useful
-        confirm_glance_active = false;
+        // Aligned - take the one reading that matters (-1 included, that's
+        // "clear ahead," not "unknown") and hand control back to normal
+        // flight/Safety_Override immediately. This is deliberately brief,
+        // not a held state: next frame, if nothing else needs the body's
+        // rotation, normal flight resumes freely until the timer fires
+        // again.
+        int beam = lround(heading / 10.0) % 36;
+        sonar_dist[beam] = RangeDist();
+        lookahead_active = false;
     }
 
   private:
@@ -1017,8 +980,11 @@ class RobustAgent {
             .right_cmd = physics.right_cmd
         };
         history.push(state);
-        // once broken, dont touch sonar_dist here anymore - only
-        // rangedist_lookahead() writes to it now, one beam at a time
+        // While sonar is healthy, sonar_dist[] just mirrors the real array
+        // every frame. Once it's broken, only rangedist_lookahead() ever
+        // touches it (one beam at a time, whenever it gets a fresh
+        // reading) - nothing here may wipe it, or every reading gets
+        // erased before Safety_Override can ever see it.
         if (sonar_broken != 1) {
             for (int i = 0; i < 36; i++)
                 sonar_dist[i] = SONAR_DIST[i];
@@ -1062,15 +1028,7 @@ class RobustAgent {
                 break;
             }
         }
-
-        // update this regardless, so a confirmation counts for a bit
-        // instead of only on the exact frame it happened
-        if (range > 0 && range < SONAR_CHECK_RANGE)
-            frames_since_confirmed_close = 0;
-        else
-            frames_since_confirmed_close++;
-
-        if (all_invalid && frames_since_confirmed_close <= SONAR_CONFIRM_GRACE_FRAMES)
+        if (all_invalid && range > 0 && range < SONAR_CHECK_RANGE)
             sonar_silent_frames++;
         else
             sonar_silent_frames = 0;
@@ -1310,9 +1268,11 @@ void Safety_Override(void) {
     )
         return agent.end_frame();
 
-    // both need to run from here, after Lander_Control's own thrust()
-    // call, so they actually get the final say on rotation
-    agent.sonar_confirm_glance();
+    // Fallback for a broken sonar - periodically points RangeDist() ahead
+    // (direction of travel) and feeds that single reading into
+    // sonar_dist[]. See rangedist_lookahead() for why this replaced trying
+    // to map the whole compass. Everything below is untouched original
+    // logic - it just now actually gets fed real data for a broken sonar.
     agent.rangedist_lookahead();
 
     // Determine the closest surfaces in the direction
