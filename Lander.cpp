@@ -585,8 +585,6 @@ class RobustAgent {
     // we're heading every so often instead of mapping the whole compass
     int lookahead_timer = 0;
     bool lookahead_active = false;
-    // one-way switch, stays true forever once we're near the platform's x
-    bool crossed_platform_x = false;
 
     PhysicsEngine physics;
     PastQuasiStates history;
@@ -746,15 +744,6 @@ class RobustAgent {
     void rangedist_lookahead() {
         if (sonar_broken != 1)
             return;
-
-        // once we've EVER been near the platform's x, turn off for good -
-        // Lander_Control already knows how to land from here
-        if (!crossed_platform_x && fabs(PLAT_X - position_x()) < ABOVE_PLATFORM_TOLERANCE)
-            crossed_platform_x = true;
-        if (crossed_platform_x) {
-            lookahead_active = false;
-            return;
-        }
 
         // close to landing altitude, dont bother - see LOOKAHEAD_MIN_ALTITUDE
         if (fabs(PLAT_X - position_x()) < LOOKAHEAD_MIN_ALTITUDE &&
