@@ -234,6 +234,16 @@
 #define DROP_MAX_FALL_SPEED 5.0
 // Within 10 px sideways counts as "over the platform" laterally
 #define ABOVE_PLATFORM_TOLERANCE 10.0
+// box around the platform where Safety_Override backs off and trusts
+// Lander_Control/the pilot. platform is ~88px wide (44px half width), so
+// this is tight, not the whole trench
+#define SAFE_LANDING_X_TOLERANCE 50.0
+#define SAFE_LANDING_Y_TOLERANCE 150.0
+// max vy to trust the box at. NOT DROP_MAX_FALL_SPEED, thats for a much
+// tighter no-thrust free fall. this is 150px out with real braking room
+// left, so match VYlim's own 100-200px tier (-10) and the assignment's
+// touchdown limit (10 m/s), not the stricter free fall number
+#define SAFE_LANDING_MAX_VY 10.0
 // Good Morning Canada. Breaking news! Our state-of-the-art Multi-Billion Dollar Rover keeps
 // thrashing for God knows why. Luckily, our greastest minds have come together to figure out issue,
 // spending hours around the clock to resolve the issue.
@@ -1215,6 +1225,24 @@ void Safety_Override(void) {
     Vmag += agent.velocity_y() * agent.velocity_y();
 
     DistLimit = fmax(75, Vmag);
+
+    // tight box over the platform, and not falling too fast (real crash
+    // risk if we backed off while still diving in hard, pilot or not).
+    // both true means trust whatever's around us, its the platform/trench,
+    // not a threat. hand control back to Lander_Control entirely
+    if (fabs(PLAT_X - agent.position_x()) < SAFE_LANDING_X_TOLERANCE &&
+        fabs(PLAT_Y - agent.position_y()) < SAFE_LANDING_Y_TOLERANCE &&
+        fabs(agent.velocity_y()) < SAFE_LANDING_MAX_VY) {
+        // clear it out, dont want a stale close reading from right before
+        // we entered the box hanging around
+        for (int i = 0; i < 36; i++)
+            agent.sonar_dist[i] = -1;
+        // also kill any sweep that was mid-progress when we crossed into
+        // the box. otherwise if we ever drift back out, it resumes a
+        // stale half-finished sweep instead of starting clean
+        agent.sweep_active = false;
+        return agent.end_frame();
+    }
 
     // sweep already going? give it total control, skip cone checks below.
     // used to fight over rotation frame by frame, jittered, never finished.
