@@ -244,6 +244,18 @@
 // left, so match VYlim's own 100-200px tier (-10) and the assignment's
 // touchdown limit (10 m/s), not the stricter free fall number
 #define SAFE_LANDING_MAX_VY 10.0
+// map is 0-1024 on both axes, per Position_X/Position_Y's own docs
+#define MAP_SIZE 1024.0
+// floor for the map edge margin at low/normal speed. NOT DistLimit, ships
+// legitimately spawn/cruise as low as y~50-90 and within ~100px of a
+// side, DistLimit's 75 floor + growth false triggers on that
+#define MAP_EDGE_MARGIN 40.0
+// deceleration assumed available to size the margin against, for when
+// speed is high enough that the floor above isnt enough runway. G_ACCEL
+// specifically, since gravity is the one thing guaranteed to still work
+// no matter whats broken. reverse_thrust also uses this to estimate its
+// own braking time, see its comment
+#define MAP_EDGE_DECEL G_ACCEL
 // Good Morning Canada. Breaking news! Our state-of-the-art Multi-Billion Dollar Rover keeps
 // thrashing for God knows why. Luckily, our greastest minds have come together to figure out issue,
 // spending hours around the clock to resolve the issue.
@@ -609,6 +621,13 @@ class RobustAgent {
     // frames in a row reacting off the same stale sonar_dist. see MAX_REACT_FRAMES
     int reacting_frames = 0;
 
+    // separate from reacting_frames above, this is just for the map edge
+    // override. counts down whatever reverse_thrust() said the current
+    // reversal needs, so we keep reversing the whole time instead of
+    // re-checking every frame (which flip-flops the rotation target
+    // before it ever finishes turning)
+    int edge_commit_frames = 0;
+
     PhysicsEngine physics;
     PastQuasiStates history;
 
@@ -690,6 +709,55 @@ class RobustAgent {
         main_thruster(0.0);
         left_thruster(0.0);
         right_thruster(0.0);
+    }
+
+    // points whichever thruster we have opposite our current velocity
+    // vector and fires it, to actively reverse whatever we're doing
+    // instead of just cutting thrust and hoping gravity is enough.
+    // unlike thrust(), this can point anywhere, even straight down,
+    // since reversing an upward velocity needs exactly that (thrust()
+    // refuses to ever request downward accel). used for the map edge
+    // override: same logic clears a climb, a leftward drift, or a
+    // rightward drift, since its all just "reverse the vector".
+    // returns how many frames this reversal is expected to take
+    // (rotation time + braking time), so the caller can size a commit
+    // window off real physics instead of a guessed constant
+    int reverse_thrust() {
+        double vx = velocity_x(), vy = velocity_y();
+        double speed = sqrt(vx * vx + vy * vy);
+        double dir = atan2(-vx, -vy) * 180.0 / PI;
+        if (dir < 0.0)
+            dir += 360.0;
+
+        WhichThruster options[3] = { MAIN_THRUSTER, LEFT_THRUSTER, RIGHT_THRUSTER };
+        unsigned int broken[3] = { mt_broken, lt_broken, rt_broken };
+        int best = -1;
+        double best_turn = 1e9;
+        for (int i = 0; i < 3; i++) {
+            if (broken[i] == 1)
+                continue;
+            double turn = fabs(find_min_travel_angle(dir - push_offset(options[i]), physics.angle));
+            if (i == current_thruster)
+                turn -= THRUSTER_SWITCH_BIAS;
+            if (turn < best_turn) {
+                best_turn = turn;
+                best = i;
+            }
+        }
+        for (int i = 0; i < 3; i++)
+            if (i != best)
+                set_power(options[i], 0.0);
+        if (best == -1)
+            return 0;
+        current_thruster = best;
+        double target = dir - push_offset(options[best]);
+        rotate_absolute(target);
+        bool aligned = fabs(find_min_travel_angle(target, physics.angle)) < FIRE_ALIGNMENT_TOLERANCE;
+        set_power(options[best], aligned ? 1.0 : 0.0);
+
+        double rotate_frames = fabs(best_turn) * PI / 180.0 / MAX_ROT_RATE;
+        double brake_frames = speed / MAP_EDGE_DECEL / T_STEP;
+        return (int) ceil(rotate_frames + brake_frames);
     }
 
 
@@ -1225,6 +1293,39 @@ void Safety_Override(void) {
     Vmag += agent.velocity_y() * agent.velocity_y();
 
     DistLimit = fmax(75, Vmag);
+
+    // absolute override, checked first, above everything else. tracked
+    // purely by position/velocity, nothing to do with sonar or the sweep,
+    // since this has to still work even if those are the things confused.
+    // margin grows with speed heading toward that edge, same idea as
+    // DistLimit but sized off MAP_EDGE_DECEL instead, see its comment.
+    // v*v/2a comes out in meters, position/margin are in px, so scale by
+    // S_SCALE or this undershoots by 5x (found this the hard way)
+    double top_margin = fmax(MAP_EDGE_MARGIN, S_SCALE * agent.velocity_y() * agent.velocity_y() / (2 * MAP_EDGE_DECEL));
+    double side_margin = fmax(MAP_EDGE_MARGIN, S_SCALE * agent.velocity_x() * agent.velocity_x() / (2 * MAP_EDGE_DECEL));
+
+    // once we commit we keep reversing every frame for however many
+    // frames reverse_thrust() itself said this would take, instead of
+    // re-checking every frame. otherwise if vy/vx hover right around 0
+    // the condition flickers true/false and the rotation target keeps
+    // getting reset before it ever actually finishes turning
+    if (agent.edge_commit_frames > 0) {
+        agent.edge_commit_frames--;
+        agent.reverse_thrust();
+        return agent.end_frame();
+    }
+    bool near_top = agent.position_y() < top_margin && agent.velocity_y() > 0;
+    bool near_left = agent.position_x() < side_margin && agent.velocity_x() < 0;
+    bool near_right = agent.position_x() > MAP_SIZE - side_margin && agent.velocity_x() > 0;
+    if (near_top || near_left || near_right) {
+        // same fix as the safe landing box: dont leave a sweep frozen
+        // mid-progress, it would resume stale once this ends
+        for (int i = 0; i < 36; i++)
+            agent.sonar_dist[i] = -1;
+        agent.sweep_active = false;
+        agent.edge_commit_frames = agent.reverse_thrust();
+        return agent.end_frame();
+    }
 
     // tight box over the platform, and not falling too fast (real crash
     // risk if we backed off while still diving in hard, pilot or not).
