@@ -197,18 +197,25 @@
 // Extra upward thrust (m/s^2) for each m/s we're falling faster than the speed limit. Lander_Control
 // adds G_ACCEL on top of this to cancel gravity, since thrust() doesn't include gravity
 #define AY_PER_VY_ERROR 6
-// Sonar does not rotate with the engine. A failed sonar reads all -1, same as
-// "nothing in range", so it's only broken if RangeDist sees something close
-// while every beam stays -1 for longer than the slowest sonar refresh (surely
-// 60 is enough. 60 fps)
-#define SONAR_CHECK_RANGE 300.0
-#define SONAR_BROKEN_FRAMES 60
-// how often we repoint RangeDist at wherever were heading, in frames
-// (60fps so this is like 2 seconds)
-#define LOOKAHEAD_INTERVAL_FRAMES 120
-// below this height AND close horizontally, stop looking ahead - not
-// enough runway left, gotta just land normally at that point
-#define LOOKAHEAD_MIN_ALTITUDE 250.0
+// sonar broken = reads -1 everywhere, same as "nothing in range". only
+// call it broken if RangeDist sees something close while all beams say -1.
+// range bumped to match the real sonar's actual reach (~420px)
+#define SONAR_CHECK_RANGE 420.0
+// silent frames in a row before calling sonar broken. lower than before,
+// just a guess, we dont know the real refresh rate
+#define SONAR_BROKEN_FRAMES 25
+// one bad frame used to wipe the whole counter to 0. too harsh for one
+// blip. now a miss just costs this many frames instead
+#define SONAR_MISS_PENALTY 8
+// how often we repoint RangeDist at our heading. ~2s at 60fps
+#define SWEEP_INTERVAL_FRAMES 120
+// beams each side of heading we sweep. 6 * 10deg = 60deg, 120deg total
+#define SWEEP_HALF_WIDTH 6
+// most reactions resolve fast (braking flips velocity sign, flips which
+// cone gets checked). stuck this long off the same stale data = force a
+// new sweep mid-react. more than a sweep takes (~60-70f), less than
+// SWEEP_INTERVAL_FRAMES so it beats the next scheduled one anyway
+#define MAX_REACT_FRAMES 90
 // fminmax. This is too small to be a function. Macro way better
 #define FMM(x, y) fmax(-(x), fmin((x), (y)))
 // Stay upright and stop propulsion sideways, but keep using the
@@ -581,10 +588,16 @@ class RobustAgent {
     int sonar_silent_frames = 0;
     int current_thruster = -1;
 
-    // state for rangedist_lookahead() - points RangeDist at wherever
-    // we're heading every so often instead of mapping the whole compass
-    int lookahead_timer = 0;
-    bool lookahead_active = false;
+    // state for rangedist_sweep(). sweeps a 120deg arc around our heading
+    // instead of mapping the whole compass. center_beam locked in at
+    // sweep start, offset walks -HALF_WIDTH to +HALF_WIDTH
+    int sweep_timer = 0;
+    bool sweep_active = false;
+    int sweep_center_beam = 0;
+    int sweep_offset = 0;
+
+    // frames in a row reacting off the same stale sonar_dist. see MAX_REACT_FRAMES
+    int reacting_frames = 0;
 
     PhysicsEngine physics;
     PastQuasiStates history;
@@ -739,77 +752,55 @@ class RobustAgent {
             set_power(options[best], 0.0);
     }
 
-    // backup plan for when sonar dies, just points RangeDist ahead every
-    // LOOKAHEAD_INTERVAL_FRAMES instead of mapping the whole compass
-    void rangedist_lookahead() {
+    // backup for when sonar dies. sweeps RangeDist across a 120deg arc
+    // around our heading every SWEEP_INTERVAL_FRAMES, instead of one
+    // straight-ahead point. fills sonar_dist, doesnt react to anything itself
+    void rangedist_sweep() {
         if (sonar_broken != 1)
             return;
 
-        // close to landing altitude, dont bother - see LOOKAHEAD_MIN_ALTITUDE
-        if (fabs(PLAT_X - position_x()) < LOOKAHEAD_MIN_ALTITUDE &&
-            PLAT_Y - position_y() < LOOKAHEAD_MIN_ALTITUDE) {
-            lookahead_active = false;
-            return;
+        sweep_timer++;
+        // hits 1 on first call after break, so we start right away
+        if (!sweep_active && (sweep_timer == 1 || sweep_timer >= SWEEP_INTERVAL_FRAMES)) {
+            // new sweep. lock heading now, not every frame, or the
+            // target beams shift under us and it never finishes
+            sweep_active = true;
+            sweep_timer = 0;
+            double heading = atan2(velocity_x(), velocity_y()) * 180.0 / PI;
+            if (heading < 0.0)
+                heading += 360.0;
+            sweep_center_beam = lround(heading / 10.0) % 36;
+            sweep_offset = -SWEEP_HALF_WIDTH;
+
+            // wipe stale readings from wherever the last sweep pointed
+            for (int i = 0; i < 36; i++)
+                sonar_dist[i] = -1;
         }
-
-        lookahead_timer++;
-        // hits 1 on the very first call after sonar breaks, so we trigger
-        // right away instead of waiting a whole interval first
-        if (!lookahead_active && (lookahead_timer == 1 || lookahead_timer >= LOOKAHEAD_INTERVAL_FRAMES)) {
-            lookahead_active = true;
-            lookahead_timer = 0;
-        }
-        if (!lookahead_active)
+        if (!sweep_active)
             return;
 
-        // recompute every frame so this tracks where we're actually
-        // headed, even mid-turn... same 0=up clockwise convention as always
-        double heading = atan2(velocity_x(), velocity_y()) * 180.0 / PI;
-        if (heading < 0.0) heading += 360.0;
+        int beam = ((sweep_center_beam + sweep_offset) % 36 + 36) % 36;
 
-        // RangeDist points out the belly (body angle + 180), so aiming at
-        // a world direction means subtracting 180 for the body target
-        double body_target = heading - 180.0;
-        if (body_target < 0.0) body_target += 360.0;
+        // RangeDist points out the belly (angle + 180), so world dir - 180
+        double body_target = beam * 10.0 - 180.0;
+        if (body_target < 0.0)
+            body_target += 360.0;
         rotate_absolute(body_target);
 
         bool aligned = fabs(find_min_travel_angle(body_target, physics.angle)) < ROTATE_TOLERANCE;
         if (!aligned) {
-            // free fall while turning - old thrust was aimed for a
-            // different angle, so it'd push the wrong way as we rotate
+            // free fall while turning, old thrust aimed wrong way now
             main_thruster(0.0);
             left_thruster(0.0);
             right_thruster(0.0);
             return;
         }
 
-        // aligned: grab the one reading we care about (-1 = clear, not
-        // unknown) and hand back control right away, not a held state
-        int beam = lround(heading / 10.0) % 36;
+        // aligned, grab this beam, move to next one in the sweep
         sonar_dist[beam] = RangeDist();
-        lookahead_active = false;
-    }
-
-    // RangeDist never fails and needs no rotation to use - it just reads
-    // whatever it's currently pointed at (main thruster direction, straight
-    // down while upright). Unlike rangedist_lookahead() above (which only
-    // runs once sonar is already dead), this runs every frame regardless of
-    // sonar status, so we always have one guaranteed-good reading on top of
-    // the 36-beam sonar cones.
-    void rangedist_watch() {
-        double reading = RangeDist();
-        if (reading < 0)
-            return; // sky/clear, nothing to do
-        double Vmag = velocity_x() * velocity_x() + velocity_y() * velocity_y();
-        if (reading < fmax(75, Vmag))
-            evade();
-    }
-
-    // Shared "something solid is too close in our direction of travel"
-    // response: brake against the direction of motion and climb, so we
-    // don't just stop sideways and keep sinking down whatever we hit.
-    void evade() {
-        thrust(velocity_x() > 0 ? -LT_ACCEL : LT_ACCEL, MT_ACCEL);
+        sweep_offset++;
+        if (sweep_offset > SWEEP_HALF_WIDTH)
+            sweep_active = false; // full 120deg swept, done for now
     }
 
   private:
@@ -947,7 +938,7 @@ class RobustAgent {
         };
         history.push(state);
         // while sonar works we just mirror the real array every frame -
-        // once broken, only rangedist_lookahead() writes to it, one beam at a time
+        // once broken, only rangedist_sweep() writes to it, one beam at a time
         if (sonar_broken != 1) {
             for (int i = 0; i < 36; i++)
                 sonar_dist[i] = SONAR_DIST[i];
@@ -991,10 +982,13 @@ class RobustAgent {
                 break;
             }
         }
-        if (all_invalid && range > 0 && range < SONAR_CHECK_RANGE)
+        if (all_invalid && range > 0 && range < SONAR_CHECK_RANGE) {
             sonar_silent_frames++;
-        else
-            sonar_silent_frames = 0;
+        } else {
+            sonar_silent_frames -= SONAR_MISS_PENALTY;
+            if (sonar_silent_frames < 0)
+                sonar_silent_frames = 0;
+        }
         if (sonar_silent_frames > SONAR_BROKEN_FRAMES)
             sonar_broken = 1;
     }
@@ -1222,30 +1216,19 @@ void Safety_Override(void) {
 
     DistLimit = fmax(75, Vmag);
 
-    // If we're close to the landing platform, disable
-    // safety override (close to the landing platform
-    // the Control_Policy() should be trusted to
-    // safely land the craft)
-    if (fabs(PLAT_X - agent.position_x()) < 150 &&
-        fabs(PLAT_Y - agent.position_y()) < 150
-    )
+    // sweep already going? give it total control, skip cone checks below.
+    // used to fight over rotation frame by frame, jittered, never finished.
+    // goes back to normal once sweep_active flips false again
+    if (agent.sweep_active) {
+        agent.rangedist_sweep();
         return agent.end_frame();
+    }
 
-    // Fallback for a broken sonar. It periodically points RangeDist() ahead
-    // (direction of travel) and feeds that single reading into
-    // sonar_dist[]. See rangedist_lookahead() for why this replaced trying
-    // to map the whole compass. Note it can zero all thrust directly
-    // (bypassing thrust()) while mid-turn, so it must run BEFORE
-    // rangedist_watch() below - otherwise it would silently cancel an
-    // evade() the watch just issued this same frame.
-    agent.rangedist_lookahead();
-
-    // RangeDist is checked every frame regardless of sonar status (see
-    // rangedist_watch()) and evades immediately if something's close. Runs
-    // last among the two so its evade (if any) isn't wiped out by the
-    // lookahead's mid-turn thrust cut above; the sonar cone checks below can
-    // still override it further if they independently agree there's danger.
-    agent.rangedist_watch();
+    // gather what horizontal/vertical checks want, dont fire yet. used to
+    // be two separate thrust() calls, second one silently wiped the first.
+    // combine into one call instead
+    bool want_react = false;
+    double react_ax = 0.0, react_ay = 0.0;
 
     // Determine the closest surfaces in the direction
     // of motion. This is done by checking the sonar
@@ -1268,12 +1251,12 @@ void Safety_Override(void) {
     // to have this distance limit modulated by horizontal speed...
     // what is it?
     if (dmin < DistLimit * fmax(.25, fmin(fabs(agent.velocity_x()) / 5.0, 1))) {
-        // Too close to a surface in the horizontal direction - this is a wall/cliff
-        // face beside us, not ground below us, so the vertical check below won't
-        // necessarily catch it. Same evade the lookahead check uses: brake against
-        // the direction of motion AND climb, so we don't just stop sideways and
-        // keep sinking down the rock face.
-        agent.evade();
+        // wall/cliff beside us, not ground below, vertical check wont
+        // catch it. brake + climb so we dont sink down the rock face.
+        // real collision risk, gets priority if vertical also fires
+        want_react = true;
+        react_ax = agent.velocity_x() > 0 ? -LT_ACCEL : LT_ACCEL;
+        react_ay = MT_ACCEL;
     }
 
     // Vertical direction
@@ -1292,16 +1275,34 @@ void Safety_Override(void) {
                 dmin = agent.sonar_dist[i];
     }
     if (dmin < DistLimit) {
-        // Too close to a surface in the vertical direction.
-        // Stop firing up if we're already climbing, otherwise go full throttle.
-        // When braking against the ground, Do not do any sideways thrust, so a single thruster
-        // points straight up instead of tilting and wasting half its thrust. If we're already climbing,
-        // then we just cut thrust, and the sideways request can stay
-        if (agent.velocity_y() > 2.0)
-            agent.thrust(agent.prev_ax, 0.0);
-        else
-            agent.thrust(0.0, MT_ACCEL);
+        // too close vertically. if horizontal already fired, leave its
+        // ax/ay alone (full climb already covers this). otherwise: stop
+        // firing up if already climbing, else full throttle
+        if (!want_react) {
+            if (agent.velocity_y() > 2.0)
+                react_ax = agent.prev_ax;
+            else
+                react_ay = MT_ACCEL;
+        }
+        want_react = true;
+    }
 
+    if (want_react) {
+        agent.thrust(react_ax, react_ay);
+        agent.reacting_frames++;
+        // stuck reacting off the same stale data too long, velocity never
+        // flipped sign to clear it naturally. force a new sweep now for
+        // fresh data, even if it costs this frame's reaction thrust
+        if (agent.reacting_frames > MAX_REACT_FRAMES) {
+            agent.rangedist_sweep();
+            agent.reacting_frames = 0;
+        }
+    } else {
+        agent.reacting_frames = 0;
+        // no sweep active (checked above), so this only starts a new one
+        // if due. skip when we just reacted, its first step could
+        // overwrite the react thrust() this same frame. one frame late, no cost
+        agent.rangedist_sweep();
     }
 
     return agent.end_frame();
