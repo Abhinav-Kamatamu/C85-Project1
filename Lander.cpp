@@ -790,6 +790,28 @@ class RobustAgent {
         lookahead_active = false;
     }
 
+    // RangeDist never fails and needs no rotation to use - it just reads
+    // whatever it's currently pointed at (main thruster direction, straight
+    // down while upright). Unlike rangedist_lookahead() above (which only
+    // runs once sonar is already dead), this runs every frame regardless of
+    // sonar status, so we always have one guaranteed-good reading on top of
+    // the 36-beam sonar cones.
+    void rangedist_watch() {
+        double reading = RangeDist();
+        if (reading < 0)
+            return; // sky/clear, nothing to do
+        double Vmag = velocity_x() * velocity_x() + velocity_y() * velocity_y();
+        if (reading < fmax(75, Vmag))
+            evade();
+    }
+
+    // Shared "something solid is too close in our direction of travel"
+    // response: brake against the direction of motion and climb, so we
+    // don't just stop sideways and keep sinking down whatever we hit.
+    void evade() {
+        thrust(velocity_x() > 0 ? -LT_ACCEL : LT_ACCEL, MT_ACCEL);
+    }
+
   private:
 
     // Rotate toward an absolute angle unless we're already close enough
@@ -1209,12 +1231,21 @@ void Safety_Override(void) {
     )
         return agent.end_frame();
 
-    // Fallback for a broken sonar - periodically points RangeDist() ahead
+    // Fallback for a broken sonar. It periodically points RangeDist() ahead
     // (direction of travel) and feeds that single reading into
     // sonar_dist[]. See rangedist_lookahead() for why this replaced trying
-    // to map the whole compass. Everything below is untouched original
-    // logic - it just now actually gets fed real data for a broken sonar.
+    // to map the whole compass. Note it can zero all thrust directly
+    // (bypassing thrust()) while mid-turn, so it must run BEFORE
+    // rangedist_watch() below - otherwise it would silently cancel an
+    // evade() the watch just issued this same frame.
     agent.rangedist_lookahead();
+
+    // RangeDist is checked every frame regardless of sonar status (see
+    // rangedist_watch()) and evades immediately if something's close. Runs
+    // last among the two so its evade (if any) isn't wiped out by the
+    // lookahead's mid-turn thrust cut above; the sonar cone checks below can
+    // still override it further if they independently agree there's danger.
+    agent.rangedist_watch();
 
     // Determine the closest surfaces in the direction
     // of motion. This is done by checking the sonar
@@ -1237,10 +1268,12 @@ void Safety_Override(void) {
     // to have this distance limit modulated by horizontal speed...
     // what is it?
     if (dmin < DistLimit * fmax(.25, fmin(fabs(agent.velocity_x()) / 5.0, 1))) {
-        // Too close to a surface in the horizontal direction.
-        // Thrust against the direction of motion, keeping whatever vertical thrust was asked for.
-        // thrust() handles the orientation, so there's no need to straighten up first
-        agent.thrust(agent.velocity_x() > 0 ? -LT_ACCEL : LT_ACCEL, agent.prev_ay);
+        // Too close to a surface in the horizontal direction - this is a wall/cliff
+        // face beside us, not ground below us, so the vertical check below won't
+        // necessarily catch it. Same evade the lookahead check uses: brake against
+        // the direction of motion AND climb, so we don't just stop sideways and
+        // keep sinking down the rock face.
+        agent.evade();
     }
 
     // Vertical direction
