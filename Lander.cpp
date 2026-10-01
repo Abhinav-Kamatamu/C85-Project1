@@ -1015,8 +1015,8 @@ class RobustAgent {
             .right_cmd = physics.right_cmd
         };
         history.push(state);
-        // while sonar works we just mirror the real array every frame -
-        // once broken, only rangedist_sweep() writes to it, one beam at a time
+        // while sonar works we just mirror the real array every frame
+        // once broken, rangedist_sweep() writes to it 
         if (sonar_broken != 1) {
             for (int i = 0; i < 36; i++)
                 sonar_dist[i] = SONAR_DIST[i];
@@ -1048,9 +1048,13 @@ class RobustAgent {
             detect_sonar_failure();
     }
 
-    // Sonar is world-fixed (SONAR_DIST[18] is always straight down) and sees
-    // ~420 px. RangeDist can also be -1 when its beam hits nothing (e.g.
-    // pointing off the map).
+    // Sonar is world-fixed and sees ~420 px. 
+    // RangeDist can also be -1 when its beam hits nothing
+    // e.g. pointing off the map
+    // Note: for all component failures, there is sometimes a delay in detecting 
+    // sonar failure, so aircraft crashes when spawning on far right side of hard map. 
+    // I sense the fix is in this function...
+    // Works fine in mode 2, though
     void detect_sonar_failure() {
         double range = RangeDist();
         int all_invalid = 1;

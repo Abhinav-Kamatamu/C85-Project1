@@ -3,10 +3,10 @@ CSCC85 - Fundamentals of Robotics and Automated Systems - UTSC
 Project 1 - Fault Tolerant Lander Control
 ______________________________________________________________________
 
-Team name:
+Team name: Pico Peppers
 
-Name 1 (last, first):
-Student number 1:
+Name 1 (last, first): Dinata, Ferissa
+Student number 1: 1010978257
 
 Name 2 (last, first):
 Student number 2:
@@ -23,16 +23,16 @@ you think the task could be completed
 
 a) The program can land the craft safely in mode '1'
   
-   - for the 'easy.ppm' map (yes/no)
-   - for the 'hard.ppm' map (yes/no)
+   - for the 'easy.ppm' map (yes/no) YES
+   - for the 'hard.ppm' map (yes/no) YES
 
    If it fails, describe the conditions in which it fails and how
    you think this could be resolved
 
 b) The program can land the craft safely in mode '2'
   
-   - for the 'easy.ppm' map (yes/no)
-   - for the 'hard.ppm' map (yes/no)
+   - for the 'easy.ppm' map (yes/no) YES
+   - for the 'hard.ppm' map (yes/no) YES
 
    If it fails, describe the conditions in which it fails and how
    you think this could be resolved
@@ -47,46 +47,72 @@ Questions:
 1) What was the impact of having noisy sensors in your ability to
    determine the state of the craft and ultimately control it 
    properly?
+   
+   - 
 
 2) Describe the technique(s) you used to deal with sensor noise
+- Averaging:
+
+- Keeping history:
+
+- ..?
 
 3) Describe your strategy for dealing with thruster failures
+
+- Lander_Control and Safety_Override never touch Main/Left/Right_Thruster directly. They ask the agent for a world-oriented thrust(ax, ay) and RobustAgent figures out delivery with whatever's still alive. All three working means stay upright, use main plus the relevant side thruster normally. Lose one causes the ship to rotate onto whichever single remaining thruster needs the least turn (with THRUSTER_SWITCH_BIAS so we don't flip-flop between two options). 
+If we lose a side thruster specifically, we tilt the main thruster to steal a sideways component instead, but capped so the tilt never lifts more than was actually asked for. We implemented boundaries on the map so that if the craft starts drifting toward the edge of the map, it automatically fires a thruster to push it back opposite the velocity before it can fly off.
+If we lose the main thruster, our strategy is to hover low on a side thruster, then at DROP_HEIGHT (36px up) go upright and perform a controlled free-fall, scaled so impact speed stays under the landing limit with a buffer to spare.
 
 4) Describe your strategy for dealing with sensor malfunctions:
 
    - Position sensors
    - Velocity sensors
    - Angle
-   - Sonar
+   - Sonar: SONAR_DIST array goes -1 when it dies, same signature as "nothing nearby," so we only call it broken once RangeDist() disagrees i.e. sees something close for SONAR_BROKEN_FRAMES straight. Once broken, we fold RangeDist into whichever single beam matches our heading and periodically rangedist_sweep() a ±60° shield to fill in the array in SONAR's stead. Safety Override simply reacts to the array and based on velocity.
 
    What if you have multiple failures? what could you do if, for
    example both position and velocity sensors became inoperative?
+   
+   - 
 
 5) What was the hardest failure type to deal with (i.e. which is
    the component, either sensor or control that makes the lander
    harder to handle?)?
+   
+   - 
 
 6) Assume a human pilot was in charge of controlling the craft 
    (i.e. the pilot has control of thrusters and rotation).
    How would you change Safety_Override() so that it prevents
    the pilot from accidentally crashing the lander?
    
+   - We'd actually keep the version we already designed for: it runs dead last, so whatever it commands is what physically happens regardless of what Lander_Control or a pilot asked for moments earlier, and we never lose control. This means we let the pilot fly freely while sensors are healthy, same as now (i,e, using cone checks, map-edge override, and the safe-landing box only step in near actual danger). 
+   The moment a sensor goes blind on one axis, we reclaim only the controls we can no longer see the effect of on that axis (i.e. use side thrusters if the X sensors are gone, and main thruster if Y is gone) and re-issue our own last known command every frame, so an untracked pilot input can't quietly poison our predictions. And if the angle sensor dies, we refuse pilot rotation entirely, for an unlogged turn breaks the one thing (our Rotate history) everything else leans on. 
+   If we actually had that shared variable set up, it would work a lot better than what we have. We would know exactly what the pilot did every frame instead of just guessing from drifted sensor readings, so our physics math would never get thrown off and we would not need to lock the pilot out of any controls at all. Basically, taking away the pilot's control is our "we can't see what you're doing, so we'll just do it ourselves" plan B, and if we could see it, we would not need a plan B.
+   
 7) Do you think it is reasonable to write such a control function?
    (i.e. a routine that takes control from a human for their
     own safety)
+    
 
 8) Should the pilot be aware that this software is present?
    (yes or no, and tell me why you think so!)
+   
+   - Yes. An override that shows up unannounced makes it look like the ship malfunctioning, rather than what it's doing, which is saving the people on the craft. If an unknowing, surprised pilot fights their own safety net, the results could be fatal, which is counter-intuitive.
 
 9) Would you buy/drive a car that you know has control software
    that will take control from you if it estimates you are
    doing something dangerous?
+   
+   - Yes, conditioned on it behaving like ours does: minimal, last-resort, with multiple fall-backs, and limited to clearly dangerous situations, such as the high-speed, incoming ground-approach checks we have in our code, rather than system broadly overriding judgment in ambiguous cases. So long that it minimizes damage and prioritizes lives, I am happy to have a system like that in place.
 
 10) Can you as an embedded systems designer think of every 
     possible scenario that could go wrong so as to write 
     control software that ALWAYS works?
 
     Think about that...
+    
+    - I feel as though we would not be able to tell every single scenario without having extensive field simulations, and maybe even in real conditions if budget allows for it. The way we could tell if our implementation worked was through rigorous testing using the simulation we had, as it is often hard to tell what hardware does without seeing it in action. 
 ________________________________________________________________
 
 Grading:
