@@ -608,6 +608,8 @@ class RobustAgent {
     // frames in a row reacting off the same stale sonar_dist. see MAX_REACT_FRAMES
     int reacting_frames = 0;
 
+    int is_framing = 0;
+
     // separate from reacting_frames above, this is just for the map edge
     // override. counts down whatever reverse_thrust() said the current
     // reversal needs, so we keep reversing the whole time instead of
@@ -687,12 +689,16 @@ class RobustAgent {
     }
 
     void begin_frame() {
-        frame++;
-        update_frame();
+        if (!is_framing)
+            frame++;
+            is_framing = 1;
+            update_frame();
     }
 
     // This will never be implemented :(
-    void end_frame() {}
+    void end_frame() {
+        is_framing = 0;
+    }
 
     // Stop thrusting and straighten up. Used for the final free fall when the main thruster is broken
     void go_upright() {
@@ -1328,6 +1334,10 @@ void Safety_Override(void) {
     double DistLimit;
     double Vmag;
     double dmin;
+
+    if (!agent.is_framing){
+        agent.begin_frame();   
+    }
 
     // Establish distance threshold based on lander
     // speed (we need more time to rectify direction
