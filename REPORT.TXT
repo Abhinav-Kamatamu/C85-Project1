@@ -3,16 +3,16 @@ CSCC85 - Fundamentals of Robotics and Automated Systems - UTSC
 Project 1 - Fault Tolerant Lander Control
 ______________________________________________________________________
 
-Team name:
+Team name: Pico Peppers
 
-Name 1 (last, first):
-Student number 1:
+Name 1 (last, first): Dinata, Ferissa
+Student number 1: 1010978257
 
-Name 2 (last, first):
-Student number 2:
+Name 2 (last, first): Oloruntobi, Adeola
+Student number 2: 1012542580
 
-Name 3 (last, first):
-Student number 3:
+Name 3 (last, first): Kamatamu, Abhinav
+Student number 3: 1012486659
 
 (special: Lose 5 marks for not completing the above information)
 _______________________________________________________________________
@@ -22,20 +22,37 @@ incomplete tasks, give a brief description of progress and how
 you think the task could be completed
 
 a) The program can land the craft safely in mode '1'
-  
-   - for the 'easy.ppm' map (yes/no)
-   - for the 'hard.ppm' map (yes/no)
+
+   - for the 'easy.ppm' map (yes/no) YES
+   - for the 'hard.ppm' map (yes/no) YES
 
    If it fails, describe the conditions in which it fails and how
    you think this could be resolved
+
+   - We tested every thruster failure on its own and in pairs by forcing them in mode 3
+   on both maps. Any single thruster failure lands every time in our runs so far. With
+   only ONE thruster left on hard.ppm it landed 17 of 18 runs (only main 6/6, only right
+   6/6, only left 5/6, probably due to bad luck).
+   - The (exceedinly rare) failures usually arises from the starting position. If the
+   ship spawns low, upside down and already falling fast right above a hill, it may not
+   have enough room to turn upright and brake in time. This could be improved by dynamically
+   switching thrusters, using whichever thruster happens to point up during the turn.
 
 b) The program can land the craft safely in mode '2'
-  
-   - for the 'easy.ppm' map (yes/no)
-   - for the 'hard.ppm' map (yes/no)
+
+   - for the 'easy.ppm' map (yes/no) YES
+   - for the 'hard.ppm' map (yes/no) YES
 
    If it fails, describe the conditions in which it fails and how
    you think this could be resolved
+
+   - Every single sensor failure lands in our runs on both maps in mode 3.
+   - The weakest case is when nearly everything is broken at once. With no position,
+   velocity, angle, or sonar sensor, our physics engine is the only source of truth
+   and it slowly drifts because it's just a model, and while a model can be very very
+   good, it can never truly predict what happens in reality.
+   - Sonar failure on hard.ppm can make landings very slow. The RangeDist-based fake sonar
+   has to do a lot of additional action to map the terrain.
 
 _______________________________________________________________________
 
@@ -45,48 +62,170 @@ Questions:
  in terms of your team's solution).
 
 1) What was the impact of having noisy sensors in your ability to
-   determine the state of the craft and ultimately control it 
+   determine the state of the craft and ultimately control it
    properly?
+
+   - Noisy sensors made it so that we couldn't just trust a single reading of a sensor.
+   Instead, every frame, we sample each sensor 12000 times (NSAMPLES) and take the mean,
+   which virtually eliminates random noise. We also use the variance of those samples
+   to determine whether a sensor is broken.
+   - The controls are noisy, but we noticed that they were also biased too. So we incorportated
+   additive and multiplicative biases to remedy this. We had to measure all of this
+   to be able to predict where the ship would be (on average).
 
 2) Describe the technique(s) you used to deal with sensor noise
 
+- Averaging: 12000 samples per sensor per frame, cached so every function that needs a
+  sensor in the same frame gets the same value. Angles are averaged relative to the previous
+  value, otherwise readings of 359 and 1 degrees would average to 180.
+
+- Physics engine: every frame we predict where the ship should be from the commands we
+  actually sent, then overwrite the prediction with every sensor that still works. Working
+  sensors reduce the internal error, and the prediction fills in for broken sensors.
+
+- Accounting for biases: we measured the thrusters and Rotate and correct for them both in
+  the commands we send and in the physics prediction. Without these corrections, error would
+  accumulate in our physics simulation, which led to early crashes.
+
 3) Describe your strategy for dealing with thruster failures
+
+   - Lander_Control and Safety_Override never touch Main/Left/Right_Thruster directly. They
+   ask the agent for a thrust(ax, ay) and RobustAgent figures out how to fire what thrusters to
+   fulfill this request.
+   - If the main thruster and the side thruster we need both work, we stay upright and use
+   them directly. So losing one side thruster only affects us when we want to push toward that
+   side. If so, then we tilt the main thruster to get a sideways component instead, and we cap it
+   so the tilt never yields more lift than what we requested.
+   - Otherwise we point one working thruster along the thrust direction, whichever needs the least
+   rotation, using THRUSTER_SWITCH_BIAS (45 degrees) to encourage the use of a same thruster so
+   we don't flip-flop between two options. We only fire once we're within 30 degrees of the target
+   angle, so we never push sideways or toward the ground while still turning. Tilt is limited
+   to 60 degrees, which leaves spare lift on a side thruster for hovering.
+   - Close above the platform (TOUCHDOWN_HEIGHT) we stay upright no matter what, since
+   touchdown must be under 15 degrees.
+   - If we lose the main thruster, being upright yields no lift. So we hover low on a side
+   thruster, then at DROP_HEIGHT (36 px above the platform) go upright and do a
+   free fall. We calculated that this would give an impact safely below the 10 m/s limit.
+   - We also implemented boundaries on the map. If the craft drifts toward an edge, it
+   automatically fires a thruster to push it back before it can fly off.
 
 4) Describe your strategy for dealing with sensor malfunctions:
 
-   - Position sensors
-   - Velocity sensors
-   - Angle
-   - Sonar
+   For all of position, velocity and angle, we detect a failure the same way: a broken
+   sensor returns random values, so the variance of our 12k samples shoots up. We
+   measured healthy vs broken variance and put the limits in between. And we assume that
+   once a sensor is broken, it stays broken, so we don't try for recovery of sensors.
+
+   - Position sensors: the physics engine keeps predicting position from the (still
+     working) velocity every frame, so a broken position sensor doesnt affect us too much.
+   - Velocity sensors: velocity is predicted from the thrust we requested. Small errors
+     would add up over time, so the gap between predicted and measured position is used
+     for corrections.
+   - Angle: Rotate never fails, so we track the angle by adding up our own Rotate commands.
+   - Sonar: SONAR_DIST goes -1 everywhere when it dies, which is unfortunately the same as
+     "nothing nearby", so we don't know the instant it breaks. So what we do is that
+     we only mark it as broken when RangeDist sees something closer than 420 pixels while
+     every beam keeps saying -1 for SONAR_BROKEN_FRAMES. Once broken, we build a fake
+     sonar out of RangeDist, which never fails:
+       * Every frame, the RangeDist reading is turned into a point on the map.
+       * We remember the last 512 of these points, and every frame work out all 36 beams
+         from where we are *now* to those points. Since we store where the ground is rather
+         than distances, the beams stay correct as we move.
+       * Every 120 frames we sweep RangeDist across +-60 degrees around our direction of
+         travel to see what's ahead, but only if there's at least 100 px of ground below us
+         and we're not falling fast, since the ship can't thrust while turning for a sweep.
+     Safety_Override then uses this fake sonar just like it would the real one.
 
    What if you have multiple failures? what could you do if, for
    example both position and velocity sensors became inoperative?
+
+   - When position sensors fail, we rely on their respective velocity sensors and vice
+   versa. When sonar fails, we rely on RangeDist. When BOTH sensors on an axis fail, there's
+   nothing left to measure that axis, so the physics engine predicts it purely from the
+   commands we sent. That works as long as we know exactly what thrust was applied.
+   - For Y specifically, there is some absolute truth left. RangeDist gives our height above
+   the ground directly below while upright, and over the platform the ground height is just
+   PLAT_Y. That could be used to correct the Y prediction during the final descent, which, at
+   that point, Y correctness matters vastly more than x correctness
 
 5) What was the hardest failure type to deal with (i.e. which is
    the component, either sensor or control that makes the lander
    harder to handle?)?
 
-6) Assume a human pilot was in charge of controlling the craft 
+   - The hardest failure type to deal with was definitely Sonar. The main backbone of
+   Safety_Override is Sonar, so without a fallback, it's completely blind. We had to rebuild
+   it out of RangeDist, which only looks in one direction at a time, so we have to remember
+   what it saw and rotate the ship to see more.
+   - Second place was losing the main thruster on hard.ppm. The only way to land is a free
+   fall, and with one thruster every sideways move also needs a rotation, which was very easy to
+   get wrong near the terrain. Our early versions kept switching between the two side
+   thrusters and never finished turning, which caused it to crash alot.
+
+6) Assume a human pilot was in charge of controlling the craft
    (i.e. the pilot has control of thrusters and rotation).
    How would you change Safety_Override() so that it prevents
    the pilot from accidentally crashing the lander?
-   
+
+   - Safety_Override runs last, so whatever it commands is what physically happens
+   regardless of what Lander_Control or a pilot asked for moments earlier. So we let the
+   pilot fly freely while sensors are healthy. We implement additional checks
+   to stop the pilot from crashing.
+   - The problem is that we can't see what the pilot commanded, so our physics engine can't
+   predict their effect. With healthy sensors that's not a problem, as the sensors correct it
+   every frame. But the moment both sensors on one axis go blind, an untracked pilot input
+   could ruin our predictions.
+   So in that case we would take over only the controls whose effect we can no longer see,
+   and re-issue our own commands for them every frame. the side thrusters if both X sensors
+   are gone. the main thruster if both Y sensors are gone. rotation if the angle sensor
+   is gone. But the pilot can keep other functionality that we deem safe for them to handle.
+
 7) Do you think it is reasonable to write such a control function?
    (i.e. a routine that takes control from a human for their
     own safety)
 
+    On one hand, I want to say yes, because humans make mistakes. Like the vast majority of
+    transport accidents like Plane or Car crashes are due to human error. However, I also do
+    not believe that code should be the sole captain. I personally believe that a human should
+    be able to override any control in normal situations, because the code can also be wrong,
+    and an alert pilot can manage that. Where I think it is reasonable is when a crash is clearly
+    and undeniably imminent. In that case, a control function can step in only for as long as the
+    danger lasts, and ideally with a way for the pilot to turn it off. That's also how we designed
+    our Safety_Override. Outside of that, software should aide, give readings, suggestions, or manage
+    some small components, but ultimately the pilot should have the veto power.
+
 8) Should the pilot be aware that this software is present?
    (yes or no, and tell me why you think so!)
+
+   - Yes. An override that shows up unannounced makes it look like the ship malfunctioning, rather
+   than what it's doing, which is saving the people on the craft. If an unknowing,
+   surprised pilot fights their own safety net, the results could be fatal, which defeats the purpose.
 
 9) Would you buy/drive a car that you know has control software
    that will take control from you if it estimates you are
    doing something dangerous?
 
-10) Can you as an embedded systems designer think of every 
-    possible scenario that could go wrong so as to write 
+   - Yes, if it follows our philosophy. minimal, last-resort, with multiple fall-backs, and limited to clearly
+   dangerous situations, such as the high-speed, incoming ground-approach checks we have in our code.
+   It should not be a system that overrides judgment in ambiguous cases. So long that it minimizes damage and
+   prioritizes lives, we have no problem using a system like that.
+
+10) Can you as an embedded systems designer think of every
+    possible scenario that could go wrong so as to write
     control software that ALWAYS works?
 
     Think about that...
+
+    - No. Most of our worst bugs were things we never thought of until a test run crashed.
+    For example, ships that spawn low and upside down above a hill, or a sonar sweep that
+    turned off all thrust right above the ground. Not to mention, the two side thrusters
+    "fighting" over which one should be used was particularly strange. None of these appeared
+    from thinking through scenarios beforehand. We couldn't have thought of these. They came
+    from running the simulation tens or even hundreds of times and reading logs of what went wrong.
+    - A realistic goal shouldn't be to create software that always works, but to create software that
+    fails gracefully, with pizzazz. It should keep working when one part breaks and have fallbacks for
+    its fallbacks. Testing is also absolutely critical. Code should be tested as much as possible.
+    Real life shouldn't be treated as a playground. Even then, the real world will unfortunately and
+    eventually throw something at it that nobody tested.
 ________________________________________________________________
 
 Grading:
@@ -101,9 +240,8 @@ Grading:
   * Lands with combinations of 2 sensors and at least
       one thruster failure on hard map                          / 15
   * Code review and answers in this report                      / 10
-  
+
   * BONUS: The lander is crunchy and can handle multiple
       sensor/engine failures, and still land on hard map        / Up to 15 depending on crunchiness
 
 Total for Project #1				                / 100
-
