@@ -218,7 +218,7 @@
 // Using a LRU Ring buffer
 #define GROUND_MEMORY 512
 // Ignore remembered points further than this (px), same as the real sonar's reach
-#define SONAR_RANGE 420.0
+#define SONAR_REACH 420.0
 // most reactions resolve fast (braking flips velocity sign, flips which
 // cone gets checked). stuck this long off the same stale data = force a
 // new sweep mid-react. more than a sweep takes (~60-70f), less than
@@ -756,6 +756,9 @@ class RobustAgent {
         // Thrusters can only ever propell. It doesn't make sense to ask a thruster to thrust and yield
         // negative acceleration in the direction that is thrusting. In general, we let gravity do the work.
         // We aren't Sebastian.
+
+        //     ^----- Peak comment btw
+        
         ay = fmax(ay, 0.0);
         prev_ax = ax;
         prev_ay = ay;
@@ -993,7 +996,7 @@ class RobustAgent {
             // up is positive like our angles
             double dy_up = physics.py - ground_points[k].y;
             double d = sqrt(dx * dx + dy_up * dy_up); // Euclidean
-            if (d > SONAR_RANGE)
+            if (d > SONAR_REACH)
                 continue;
             double ang = atan2(dx, dy_up) * 180.0 / PI;
             if (ang < 0.0)
