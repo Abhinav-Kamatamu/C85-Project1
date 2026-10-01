@@ -217,6 +217,7 @@
 // SWEEP_INTERVAL_FRAMES so it beats the next scheduled one anyway
 #define MAX_REACT_FRAMES 90
 // fminmax. This is too small to be a function. Macro way better
+// This evaluates to: Force y to be clamped to the range [-x, x]
 #define FMM(x, y) fmax(-(x), fmin((x), (y)))
 // Stay upright and stop propulsion sideways, but keep using the
 // main thruster to control the descent all the way down.
@@ -279,35 +280,6 @@ enum WhichThruster {
 
 struct Stats {
     double mean, variance;
-};
-
-// A summary of a snapshot of the rover's current state
-struct QuasiState {
-    double px, py, vx, vy, angle, range;
-    double main_cmd, left_cmd, right_cmd;
-};
-
-// Ring buffer of the last HISTORY_LENGTH frames (no need to use vector)
-struct PastQuasiStates {
-    QuasiState states[HISTORY_LENGTH];
-    int head = -1;
-    int count = 0;
-
-    void push(QuasiState state) {
-        head = (head + 1) % HISTORY_LENGTH;
-        states[head] = state;
-        if (count < HISTORY_LENGTH)
-            count++;
-    }
-
-    // Retrieves the summaray from 'frame" frames ago
-    // 0 = this frame, 1 = last frame, ... NULL if we don't have that many
-    // frames yet
-    QuasiState *ago(int frames) {
-        if (frames < 0 || frames >= count)
-            return NULL;
-        return states + ((head - frames + HISTORY_LENGTH) % HISTORY_LENGTH);
-    }
 };
 
 // An adaptive physics engine that predicts where the rover should be.
@@ -629,7 +601,6 @@ class RobustAgent {
     int edge_commit_frames = 0;
 
     PhysicsEngine physics;
-    PastQuasiStates history;
 
     // last thrust() request, so Safety_Override can override one half
     double prev_ax = 0, prev_ay = 0;
@@ -765,6 +736,9 @@ class RobustAgent {
         // Thrusters can only ever propell. It doesn't make sense to ask a thruster to thrust and yield
         // negative acceleration in the direction that is thrusting. In general, we let gravity do the work.
         // We aren't Sebastian.
+
+        //     ^----- Peak comment btw
+        
         ay = fmax(ay, 0.0);
         prev_ax = ax;
         prev_ay = ay;
@@ -1003,20 +977,8 @@ class RobustAgent {
                 physics.correct_angle(Robust(Angle).mean);
         }
 
-        QuasiState state = {
-            .px = physics.px,
-            .py = physics.py,
-            .vx = physics.vx,
-            .vy = physics.vy,
-            .angle = physics.angle,
-            .range = RangeDist(),
-            .main_cmd = physics.main_cmd,
-            .left_cmd = physics.left_cmd,
-            .right_cmd = physics.right_cmd
-        };
-        history.push(state);
-        // while sonar works we just mirror the real array every frame
-        // once broken, rangedist_sweep() writes to it 
+        // while sonar works we just mirror the real array every frame -
+        // once broken, only rangedist_lookahead() writes to it, one beam at a time
         if (sonar_broken != 1) {
             for (int i = 0; i < 36; i++)
                 sonar_dist[i] = SONAR_DIST[i];
