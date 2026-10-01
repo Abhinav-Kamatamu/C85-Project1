@@ -164,7 +164,6 @@
 #define MAIN_OFFSET 0.0
 #define LEFT_OFFSET 90.0
 #define RIGHT_OFFSET -90.0
-#define HISTORY_LENGTH 64
 // Setting a thruster to 0 seems to set it to 2.5% of it's max power
 // on average, and every rotate seems to drift a bit by this as well
 #define ADDITIVE_BIAS 0.025
@@ -211,12 +210,22 @@
 #define SWEEP_INTERVAL_FRAMES 120
 // beams each side of heading we sweep. 6 * 10deg = 60deg, 120deg total
 #define SWEEP_HALF_WIDTH 6
+// A sweep can mean 60-70 frames with no thrust
+// So only sweep when we are slow and have some space
+#define SWEEP_MIN_CLEARANCE 100.0  // px of ground below us needed to start or continue a sweep
+#define SWEEP_MAX_FALL_SPEED 3.0   // don't sweep while falling faster than this
+// My ground memory idea :D
+// Using a LRU Ring buffer
+#define GROUND_MEMORY 512
+// Ignore remembered points further than this (px), same as the real sonar's reach
+#define SONAR_RANGE 420.0
 // most reactions resolve fast (braking flips velocity sign, flips which
 // cone gets checked). stuck this long off the same stale data = force a
 // new sweep mid-react. more than a sweep takes (~60-70f), less than
 // SWEEP_INTERVAL_FRAMES so it beats the next scheduled one anyway
 #define MAX_REACT_FRAMES 90
 // fminmax. This is too small to be a function. Macro way better
+// This evaluates to: Force y to be clamped to the range [-x, x]
 #define FMM(x, y) fmax(-(x), fmin((x), (y)))
 // Stay upright and stop propulsion sideways, but keep using the
 // main thruster to control the descent all the way down.
@@ -281,33 +290,9 @@ struct Stats {
     double mean, variance;
 };
 
-// A summary of a snapshot of the rover's current state
-struct QuasiState {
-    double px, py, vx, vy, angle, range;
-    double main_cmd, left_cmd, right_cmd;
-};
-
-// Ring buffer of the last HISTORY_LENGTH frames (no need to use vector)
-struct PastQuasiStates {
-    QuasiState states[HISTORY_LENGTH];
-    int head = -1;
-    int count = 0;
-
-    void push(QuasiState state) {
-        head = (head + 1) % HISTORY_LENGTH;
-        states[head] = state;
-        if (count < HISTORY_LENGTH)
-            count++;
-    }
-
-    // Retrieves the summaray from 'frame" frames ago
-    // 0 = this frame, 1 = last frame, ... NULL if we don't have that many
-    // frames yet
-    QuasiState *ago(int frames) {
-        if (frames < 0 || frames >= count)
-            return NULL;
-        return states + ((head - frames + HISTORY_LENGTH) % HISTORY_LENGTH);
-    }
+// Ground points seen by RangeDist, in map coordinates (px, y grows downward). See remember_ground()
+struct Point {
+    double x, y;
 };
 
 // An adaptive physics engine that predicts where the rover should be.
@@ -617,7 +602,9 @@ class RobustAgent {
     bool sweep_active = false;
     int sweep_center_beam = 0;
     int sweep_offset = 0;
-
+    // Most recent distance (px) to the ground below us. Measured with RangeDist while roughly upright,
+    // and kept up to date with our vertical motion while it's pointing elsewhere (e.g. mid-sweep)
+    double ground_clearance = 1e9;
     // frames in a row reacting off the same stale sonar_dist. see MAX_REACT_FRAMES
     int reacting_frames = 0;
 
@@ -629,7 +616,10 @@ class RobustAgent {
     int edge_commit_frames = 0;
 
     PhysicsEngine physics;
-    PastQuasiStates history;
+    
+    Point ground_points[GROUND_MEMORY];
+    int ground_count = 0;
+    int ground_head = -1;
 
     // last thrust() request, so Safety_Override can override one half
     double prev_ax = 0, prev_ay = 0;
@@ -701,6 +691,7 @@ class RobustAgent {
         update_frame();
     }
 
+    // This will never be implemented :(
     void end_frame() {}
 
     // Stop thrusting and straighten up. Used for the final free fall when the main thruster is broken
@@ -836,7 +827,11 @@ class RobustAgent {
     void rangedist_sweep() {
         if (sonar_broken != 1)
             return;
-
+        // If it's not safe to sweep then... you guessed it, don't sweep
+        if (!safe_to_sweep()) {
+            sweep_active = false;
+            return;
+        }
         sweep_timer++;
         // hits 1 on first call after break, so we start right away
         if (!sweep_active && (sweep_timer == 1 || sweep_timer >= SWEEP_INTERVAL_FRAMES)) {
@@ -849,10 +844,7 @@ class RobustAgent {
                 heading += 360.0;
             sweep_center_beam = lround(heading / 10.0) % 36;
             sweep_offset = -SWEEP_HALF_WIDTH;
-
-            // wipe stale readings from wherever the last sweep pointed
-            for (int i = 0; i < 36; i++)
-                sonar_dist[i] = -1;
+            // We now have a separate step to rebuild sonar
         }
         if (!sweep_active)
             return;
@@ -875,7 +867,7 @@ class RobustAgent {
         }
 
         // aligned, grab this beam, move to next one in the sweep
-        sonar_dist[beam] = RangeDist();
+        // We now have a separate step to rebuild sonar
         sweep_offset++;
         if (sweep_offset > SWEEP_HALF_WIDTH)
             sweep_active = false; // full 120deg swept, done for now
@@ -972,6 +964,48 @@ class RobustAgent {
         physics.right_cmd = normalize_value(power, Nthrust);
         Right_Thruster(physics.right_cmd);
     }
+
+    bool safe_to_sweep() {
+        return ground_clearance > SWEEP_MIN_CLEARANCE && physics.vy > -SWEEP_MAX_FALL_SPEED;
+    }
+
+    // Convert a RangeDist reading into a point on the map. world_angle is where RangeDist pointed
+    // so our angle + 180
+    void remember_ground(double range, double world_angle) {
+        double a = world_angle * PI / 180.0;
+        ground_head = (ground_head + 1) % GROUND_MEMORY;
+        ground_points[ground_head].x = physics.px + range * sin(a);
+        ground_points[ground_head].y = physics.py - range * cos(a);
+        if (ground_count < GROUND_MEMORY)
+            ground_count++;
+    }
+
+    // Fake sonar: work out every beam from where we are NOW to the remembered ground points,
+    // keeping the closest point per beam. Unlike stored distances, these never go stale as we move
+    void reconstruct_sonar_from_readings() {
+        // This is where we reset readings
+        for (int i = 0; i < 36; i++)
+            sonar_dist[i] = -1;
+        // And now we reinsert entries back into sonar
+        for (int k = 0; k < ground_count; k++) {
+            double dx = ground_points[k].x - physics.px;
+            // flip y because y is weird, look at thruster note.
+            // up is positive like our angles
+            double dy_up = physics.py - ground_points[k].y;
+            double d = sqrt(dx * dx + dy_up * dy_up); // Euclidean
+            if (d > SONAR_RANGE)
+                continue;
+            double ang = atan2(dx, dy_up) * 180.0 / PI;
+            if (ang < 0.0)
+                ang += 360.0;
+            // Convert into an angle
+            int beam = (int) lround(ang / 10.0) % 36;
+            // Only set if this would be the first reading or if
+            // this would be the closest reading
+            if (sonar_dist[beam] < 0 || d < sonar_dist[beam])
+                sonar_dist[beam] = d;
+        }
+    }
     
     // Once per frame: predict, detect failures, correct with healthy sensors,
     // remember
@@ -1003,24 +1037,26 @@ class RobustAgent {
                 physics.correct_angle(Robust(Angle).mean);
         }
 
-        QuasiState state = {
-            .px = physics.px,
-            .py = physics.py,
-            .vx = physics.vx,
-            .vy = physics.vy,
-            .angle = physics.angle,
-            .range = RangeDist(),
-            .main_cmd = physics.main_cmd,
-            .left_cmd = physics.left_cmd,
-            .right_cmd = physics.right_cmd
-        };
-        history.push(state);
+        double range = RangeDist();
         // while sonar works we just mirror the real array every frame
         // once broken, rangedist_sweep() writes to it 
+        // it fills in the arc around our sweep, and additionally,
+        // the beam RangeDist is pointing along always gets the true reading
         if (sonar_broken != 1) {
             for (int i = 0; i < 36; i++)
                 sonar_dist[i] = SONAR_DIST[i];
+        }  else {
+            // Sonar is broken, so we remember what RangeDist sees rn
+            // then construct the fake sonar from what we remember
+            if (range > 0)
+                remember_ground(range, physics.angle + 180.0);
+            reconstruct_sonar_from_readings();
         }
+        double tilt = fabs(find_min_travel_angle(0.0, physics.angle));
+        if (range > 0 && tilt < 30.0)
+            ground_clearance = range * cos(tilt * PI / 180.0);
+        else
+            ground_clearance += physics.vy * T_STEP * S_SCALE;
     }
 
     // Once something is broken, it stays broken, so broken sensors aren't
@@ -1389,7 +1425,7 @@ void Safety_Override(void) {
         // real collision risk, gets priority if vertical also fires
         want_react = true;
         react_ax = agent.velocity_x() > 0 ? -LT_ACCEL : LT_ACCEL;
-        react_ay = MT_ACCEL;
+        react_ay = G_ACCEL; // Maintain height, not climb
     }
 
     // Vertical direction
@@ -1411,13 +1447,15 @@ void Safety_Override(void) {
         // too close vertically. if horizontal already fired, leave its
         // ax/ay alone (full climb already covers this). otherwise: stop
         // firing up if already climbing, else full throttle
-        if (!want_react) {
-            if (agent.velocity_y() > 2.0)
-                react_ax = agent.prev_ax;
-            else
-                react_ay = MT_ACCEL;
+        if (agent.velocity_y() > 2.0) {
+            // We are climbing. Keep the sideways request
+            if (!want_react)
+                react_ax = agent.prev_ax; // Same as previous
+        } else {
+            // Ground is below us but were not climbing. Full throttle.
+            react_ay = MT_ACCEL;
         }
-        want_react = true;
+        want_react = true; // Same as previous
     }
 
     if (want_react) {
@@ -1427,6 +1465,7 @@ void Safety_Override(void) {
         // flipped sign to clear it naturally. force a new sweep now for
         // fresh data, even if it costs this frame's reaction thrust
         if (agent.reacting_frames > MAX_REACT_FRAMES) {
+            agent.sweep_timer = SWEEP_INTERVAL_FRAMES; // make rangedist_sweep() start a new sweep now
             agent.rangedist_sweep();
             agent.reacting_frames = 0;
         }
