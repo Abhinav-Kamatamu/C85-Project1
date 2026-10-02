@@ -689,10 +689,11 @@ class RobustAgent {
     }
 
     void begin_frame() {
-        if (!is_framing)
+        if (!is_framing){
             frame++;
-            is_framing = 1;
             update_frame();
+        }
+        is_framing = 1;
     }
 
     // This will never be implemented :(
